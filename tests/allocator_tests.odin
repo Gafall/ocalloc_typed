@@ -290,70 +290,78 @@ test_allocator_randomized_resize_stress :: proc(t: ^testing.T, allocator: mem.Al
 default_allocator_basic :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_basic(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_zeroed_alloc(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_alignment :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_alignment(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_pattern_fill :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_pattern_fill(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_resize_grow :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_resize_grow(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_resize_shrink :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_resize_shrink(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_randomized_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_randomized_stress(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }
 
 @(test)
 default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
 	test_allocator_randomized_resize_stress(t, context.allocator)
-	hardened_alloc.segregated_free_list_destroy(&all)
 }

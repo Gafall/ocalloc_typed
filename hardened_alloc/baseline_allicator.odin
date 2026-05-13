@@ -6,24 +6,19 @@ import "core:mem"
 // The following code is largely based on how some of the official Odin allocators
 // https://github.com/odin-lang/Odin/blob/16ebdc19dd1743d8432aefa55cbc847530399d4d/core/mem/allocators.odin
 
-SEGREGATED_FREE_LIST_CLASS_COUNT :: 32
-SEGREGATED_FREE_LIST_MIN_CLASS_SIZE :: 32
-SEGREGATED_FREE_LIST_MIN_SPLIT_PAYLOAD :: 16
-SEGREGATED_FREE_LIST_DEFAULT_REGION_SIZE :: 64 * mem.DEFAULT_PAGE_SIZE
-
 Segregated_Free_List :: struct {
 	fallback_allocator: Allocator,
-	regions:           ^Segregated_Free_List_Region,
-	free_lists:        [SEGREGATED_FREE_LIST_CLASS_COUNT]^Segregated_Free_Block,
-	used:              int,
-	peak_used:         int,
+	regions:            ^Segregated_Free_List_Region,
+	free_lists:         [SIZE_CLASS_COUNT]^Segregated_Free_Block,
+	used:               int,
+	peak_used:          int,
 }
 
 Segregated_Free_List_Region :: struct {
-	next:   ^Segregated_Free_List_Region,
-	memory: []byte,
+	next:         ^Segregated_Free_List_Region,
+	memory:       []byte,
 	usable_start: rawptr,
-	usable_size: int,
+	usable_size:  int,
 }
 
 Segregated_Free_Block :: struct #align (align_of(uintptr)) {
@@ -160,7 +155,7 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 	region := block.region
 
 	remaining := block.size - used_size
-	min_split_size := size_of(Segregated_Free_Block) + SEGREGATED_FREE_LIST_MIN_SPLIT_PAYLOAD
+	min_split_size := size_of(Segregated_Free_Block) + MIN_SPLIT_PAYLOAD
 
 	if remaining >= min_split_size {
 		block_addr := uintptr(block)
@@ -427,10 +422,7 @@ segregated_free_list_add_region_for_request :: proc(
 		minimum_allocation_size += alignment - 1
 	}
 
-	minimum_block_size := max(
-		size_of(Segregated_Free_Block),
-		minimum_allocation_size,
-	)
+	minimum_block_size := max(size_of(Segregated_Free_Block), minimum_allocation_size)
 
 	region_header_size := int(
 		segregated_free_list_align_up(
@@ -439,19 +431,12 @@ segregated_free_list_add_region_for_request :: proc(
 		),
 	)
 
-	region_alignment := max(
-		align_of(Segregated_Free_List_Region),
-		align_of(Segregated_Free_Block),
-	)
+	region_alignment := max(align_of(Segregated_Free_List_Region), align_of(Segregated_Free_Block))
 
 	minimum_region_size := region_header_size + minimum_block_size
 
-	region_allocation_size := max(
-		SEGREGATED_FREE_LIST_DEFAULT_REGION_SIZE,
-		minimum_region_size,
-	)
+	region_allocation_size := max(DEFAULT_REGION_SIZE, minimum_region_size)
 
-	// _request_memory may return an unaligned address, so reserve slack.
 	region_allocation_size += region_alignment - 1
 
 	raw_region_memory, memory_err := _request_memory(
@@ -465,17 +450,14 @@ segregated_free_list_add_region_for_request :: proc(
 
 	raw_start := uintptr(raw_data(raw_region_memory))
 
-	usable_start := segregated_free_list_align_up(
-		raw_start,
-		uintptr(region_alignment),
-	)
+	usable_start := segregated_free_list_align_up(raw_start, uintptr(region_alignment))
 
 	alignment_offset := int(usable_start - raw_start)
 	usable_size := len(raw_region_memory) - alignment_offset
 
 	region := (^Segregated_Free_List_Region)(rawptr(usable_start))
 
-	region^ = Segregated_Free_List_Region{
+	region^ = Segregated_Free_List_Region {
 		next         = s.regions,
 		memory       = raw_region_memory,
 		usable_start = rawptr(usable_start),
@@ -515,7 +497,8 @@ segregated_free_list_find_block :: proc(
 	}
 
 	start_class := segregated_free_list_class_index(minimum_possible)
-	for class := start_class; class < SEGREGATED_FREE_LIST_CLASS_COUNT; class += 1 {
+
+	for class in start_class ..< SIZE_CLASS_COUNT {
 		prev = nil
 		block = s.free_lists[class]
 		for block != nil {
@@ -571,12 +554,14 @@ segregated_free_list_align_up :: proc(value, alignment: uintptr) -> uintptr {
 
 @(require_results)
 segregated_free_list_class_index :: proc(size: int) -> int {
-	threshold := SEGREGATED_FREE_LIST_MIN_CLASS_SIZE
+	threshold := MIN_SIZE_CLASS
 	index := 0
-	for index < SEGREGATED_FREE_LIST_CLASS_COUNT - 1 && size > threshold {
+
+	for index < SIZE_CLASS_COUNT - 1 && size > threshold {
 		threshold <<= 1
 		index += 1
 	}
+
 	return index
 }
 
@@ -613,7 +598,7 @@ segregated_free_list_coalesce :: proc(
 	for {
 		merged := false
 
-		for class_index := 0; class_index < SEGREGATED_FREE_LIST_CLASS_COUNT; class_index += 1 {
+		for class_index in 0 ..< SIZE_CLASS_COUNT {
 			prev: ^Segregated_Free_Block = nil
 			other := s.free_lists[class_index]
 

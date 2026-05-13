@@ -3,6 +3,9 @@
 package hardened_alloc
 
 import "core:mem"
+import "core:sync"
+
+_sbrk_mutex: sync.Mutex
 
 when ODIN_OS == .Darwin {
 	foreign import libc "system:System"
@@ -49,6 +52,8 @@ _request_memory :: proc "contextless" (
 	[]byte,
 	mem.Allocator_Error,
 ) {
+	sync.mutex_lock(&_sbrk_mutex)
+	defer sync.mutex_unlock(&_sbrk_mutex)
 
 	head := _expand_heap(size)
 	if uintptr(head) == ~uintptr(0) {
