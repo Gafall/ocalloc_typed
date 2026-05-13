@@ -1,3 +1,4 @@
+#+build windows, js, wasi, freestanding, orca
 #+private
 package hardened_alloc
 
@@ -18,3 +19,4 @@ _request_memory :: proc(
 _free_memory :: proc(bytes: []byte, allocator: Allocator) -> Allocator_Error {
 	return mem.free_bytes(bytes, allocator)
 }
+

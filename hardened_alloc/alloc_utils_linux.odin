@@ -49,10 +49,12 @@ _request_memory :: proc "contextless" (
 	[]byte,
 	mem.Allocator_Error,
 ) {
+
 	head := _expand_heap(size)
-	if head == rawptr(-1) {
+	if uintptr(head) == ~uintptr(0) {
 		return nil, .Out_Of_Memory
 	}
 
 	return mem.byte_slice(head, size), nil
 }
+

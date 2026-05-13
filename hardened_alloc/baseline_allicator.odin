@@ -22,6 +22,8 @@ Segregated_Free_List :: struct {
 Segregated_Free_List_Region :: struct {
 	next:   ^Segregated_Free_List_Region,
 	memory: []byte,
+	usable_start: rawptr,
+	usable_size: int,
 }
 
 Segregated_Free_Block :: struct #align (align_of(uintptr)) {
@@ -212,8 +214,8 @@ segregated_free_list_free :: proc(
 		return .Invalid_Pointer
 	}
 
-	region_start := uintptr(raw_data(region.memory))
-	region_end := region_start + uintptr(len(region.memory))
+	region_start := uintptr(region.usable_start)
+	region_end := region_start + uintptr(region.usable_size)
 
 	if !(region_start <= user_addr && user_addr < region_end) {
 		return .Invalid_Pointer
@@ -398,8 +400,8 @@ segregated_free_list_allocator_proc :: proc(
 				return nil, .Invalid_Pointer
 			}
 
-			region_start := uintptr(raw_data(region.memory))
-			region_end := region_start + uintptr(len(region.memory))
+			region_start := uintptr(region.usable_start)
+			region_end := region_start + uintptr(region.usable_size)
 			if !(region_start <= ptr && ptr < region_end) {
 				return nil, .Invalid_Pointer
 			}
@@ -420,11 +422,15 @@ segregated_free_list_add_region_for_request :: proc(
 	alignment: int,
 	loc := #caller_location,
 ) -> Allocator_Error {
-	minimum_block_size := size + size_of(Segregated_Free_List_Allocation_Header)
+	minimum_allocation_size := size + size_of(Segregated_Free_List_Allocation_Header)
 	if alignment > 1 {
-		minimum_block_size += alignment - 1
+		minimum_allocation_size += alignment - 1
 	}
-	minimum_block_size += size_of(Segregated_Free_Block)
+
+	minimum_block_size := max(
+		size_of(Segregated_Free_Block),
+		minimum_allocation_size,
+	)
 
 	region_header_size := int(
 		segregated_free_list_align_up(
@@ -433,38 +439,61 @@ segregated_free_list_add_region_for_request :: proc(
 		),
 	)
 
-	minimum_region_size := region_header_size + minimum_block_size
-	region_allocation_size := max(SEGREGATED_FREE_LIST_DEFAULT_REGION_SIZE, minimum_region_size)
-	region_allocation_size = int(
-		segregated_free_list_align_up(
-			uintptr(region_allocation_size),
-			uintptr(align_of(Segregated_Free_Block)),
-		),
+	region_alignment := max(
+		align_of(Segregated_Free_List_Region),
+		align_of(Segregated_Free_Block),
 	)
 
-	region_memory, memory_err := _request_memory(
+	minimum_region_size := region_header_size + minimum_block_size
+
+	region_allocation_size := max(
+		SEGREGATED_FREE_LIST_DEFAULT_REGION_SIZE,
+		minimum_region_size,
+	)
+
+	// _request_memory may return an unaligned address, so reserve slack.
+	region_allocation_size += region_alignment - 1
+
+	raw_region_memory, memory_err := _request_memory(
 		region_allocation_size,
-		max(align_of(Segregated_Free_List_Region), align_of(Segregated_Free_Block)),
+		region_alignment,
 		s.fallback_allocator,
 	)
 	if memory_err != nil {
 		return memory_err
 	}
 
-	region := (^Segregated_Free_List_Region)(raw_data(region_memory))
-	region^ = Segregated_Free_List_Region {
-		next   = s.regions,
-		memory = region_memory,
+	raw_start := uintptr(raw_data(raw_region_memory))
+
+	usable_start := segregated_free_list_align_up(
+		raw_start,
+		uintptr(region_alignment),
+	)
+
+	alignment_offset := int(usable_start - raw_start)
+	usable_size := len(raw_region_memory) - alignment_offset
+
+	region := (^Segregated_Free_List_Region)(rawptr(usable_start))
+
+	region^ = Segregated_Free_List_Region{
+		next         = s.regions,
+		memory       = raw_region_memory,
+		usable_start = rawptr(usable_start),
+		usable_size  = usable_size,
 	}
+
 	s.regions = region
 
-	block_addr := uintptr(raw_data(region_memory)) + uintptr(region_header_size)
-	block_size := len(region_memory) - region_header_size
+	block_addr := usable_start + uintptr(region_header_size)
+	block_size := usable_size - region_header_size
+
 	block := (^Segregated_Free_Block)(rawptr(block_addr))
 	block.size = block_size
 	block.region = region
 	block.next = nil
+
 	segregated_free_list_insert_free_block(s, block)
+
 	return nil
 }
 
