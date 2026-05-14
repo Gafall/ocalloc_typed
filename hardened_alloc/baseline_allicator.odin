@@ -2,7 +2,7 @@ package hardened_alloc
 
 import "base:runtime"
 import "core:mem"
-import "core:log"
+import "core:sync"
 
 // The following code is largely based on how some of the official Odin allocators
 // https://github.com/odin-lang/Odin/blob/16ebdc19dd1743d8432aefa55cbc847530399d4d/core/mem/allocators.odin
@@ -13,6 +13,7 @@ Segregated_Free_List :: struct {
 	free_lists:         [SIZE_CLASS_COUNT]^Segregated_Free_Block,
 	used:               int,
 	peak_used:          int,
+	mutex:              sync.Mutex,
 }
 
 Segregated_Free_List_Region :: struct {
@@ -111,6 +112,7 @@ segregated_free_list_destroy :: proc(s: ^Segregated_Free_List, loc := #caller_lo
 	s.free_lists = {}
 	s.used = 0
 	s.fallback_allocator = {}
+	s.mutex = {}
 }
 
 @(require_results, no_sanitize_address)
@@ -123,6 +125,8 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 	[]byte,
 	Allocator_Error,
 ) {
+	sync.mutex_guard(&s.mutex)
+
 	if size == 0 {
 		return nil, nil
 	}
@@ -197,6 +201,8 @@ segregated_free_list_free :: proc(
 	ptr: rawptr,
 	loc := #caller_location,
 ) -> Allocator_Error {
+	sync.mutex_guard(&s.mutex)
+
 	if ptr == nil {
 		return nil
 	}

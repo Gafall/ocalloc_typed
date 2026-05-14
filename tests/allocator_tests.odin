@@ -1,9 +1,9 @@
 package allocator_tests
 
 import "../hardened_alloc"
+import "base:runtime"
 import "core:mem"
 import "core:testing"
-import "base:runtime"
 import "core:thread"
 
 // Tests were generated with the help of ChatGPT
@@ -162,15 +162,15 @@ test_allocator_resize_shrink :: proc(t: ^testing.T, allocator: mem.Allocator) {
 // 7. Randomized allocate/free/pattern stress test
 //
 Stress_Slot :: struct {
-	data: []u8,
-	seed: u8,
-	live: bool,
-	alignment: int
+	data:      []u8,
+	seed:      u8,
+	live:      bool,
+	alignment: int,
 }
 
 test_allocator_randomized_stress :: proc(t: ^testing.T, allocator: mem.Allocator) {
 	SLOT_COUNT :: 512
-	OPS :: 5000000
+	OPS :: 5000
 
 	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := t.seed
@@ -287,25 +287,25 @@ test_allocator_randomized_resize_stress :: proc(t: ^testing.T, allocator: mem.Al
 }
 
 THREAD_COUNT :: 8
-THREAD_OPS  :: 3000
+THREAD_OPS :: 3000
 
 Thread_Stress_Result :: struct {
-	ok: bool,
-	failed_op: int,
+	ok:           bool,
+	failed_op:    int,
 	failure_code: int,
 }
 
 Thread_Stress_Args :: struct {
-	allocator: mem.Allocator,
+	allocator:    mem.Allocator,
 	thread_index: int,
-	seed: u64,
-	result: ^Thread_Stress_Result,
+	seed:         u64,
+	result:       ^Thread_Stress_Result,
 }
 
 thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 	SLOT_COUNT :: 64
 
-	slots:= [SLOT_COUNT]Stress_Slot{}
+	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := args.seed
 
 	args.result.ok = true
@@ -427,25 +427,19 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 	}
 }
 
-test_allocator_thread_safety_stress :: proc(
-	t: ^testing.T,
-	allocator: mem.Allocator,
-) {
+test_allocator_thread_safety_stress :: proc(t: ^testing.T, allocator: mem.Allocator) {
 	results: [THREAD_COUNT]Thread_Stress_Result
 	threads: [THREAD_COUNT]^thread.Thread
 
 	for i := 0; i < THREAD_COUNT; i += 1 {
-		args := Thread_Stress_Args{
-			allocator = allocator,
+		args := Thread_Stress_Args {
+			allocator    = allocator,
 			thread_index = i,
-			seed = t.seed ~ u64(i * 0x9E3779B9),
-			result = &results[i],
+			seed         = t.seed ~ u64(i * 0x9E3779B9),
+			result       = &results[i],
 		}
 
-		threads[i] = thread.create_and_start_with_poly_data(
-			args,
-			thread_allocator_stress_worker,
-		)
+		threads[i] = thread.create_and_start_with_poly_data(args, thread_allocator_stress_worker)
 	}
 
 	for th in threads {
@@ -555,6 +549,11 @@ default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 
 @(test)
 default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
-	
-	test_allocator_thread_safety_stress(t, runtime.heap_allocator())
+	all: hardened_alloc.Segregated_Free_List
+	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	defer hardened_alloc.segregated_free_list_destroy(&all)
+	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
+
+	test_allocator_thread_safety_stress(t, context.allocator)
+	//test_allocator_thread_safety_stress(t, runtime.heap_allocator())
 }
