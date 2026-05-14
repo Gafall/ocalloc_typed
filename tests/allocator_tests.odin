@@ -3,6 +3,8 @@ package allocator_tests
 import "../hardened_alloc"
 import "core:mem"
 import "core:testing"
+import "base:runtime"
+import "core:thread"
 
 // Tests were generated with the help of ChatGPT
 // https://chatgpt.com/s/t_6a040a670be88191b68fd3ff53e8210f
@@ -163,13 +165,14 @@ Stress_Slot :: struct {
 	data: []u8,
 	seed: u8,
 	live: bool,
+	alignment: int
 }
 
 test_allocator_randomized_stress :: proc(t: ^testing.T, allocator: mem.Allocator) {
 	SLOT_COUNT :: 512
 	OPS :: 5000000
 
-	slots: [SLOT_COUNT]Stress_Slot
+	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := t.seed
 
 	for op := 0; op < OPS; op += 1 {
@@ -208,6 +211,7 @@ test_allocator_randomized_stress :: proc(t: ^testing.T, allocator: mem.Allocator
 			slot.data = buf
 			slot.seed = seed
 			slot.live = true
+			slot.alignment = alignment
 		} else {
 			testing.expectf(
 				t,
@@ -282,10 +286,193 @@ test_allocator_randomized_resize_stress :: proc(t: ^testing.T, allocator: mem.Al
 	}
 }
 
+THREAD_COUNT :: 8
+THREAD_OPS  :: 3000
+
+Thread_Stress_Result :: struct {
+	ok: bool,
+	failed_op: int,
+	failure_code: int,
+}
+
+Thread_Stress_Args :: struct {
+	allocator: mem.Allocator,
+	thread_index: int,
+	seed: u64,
+	result: ^Thread_Stress_Result,
+}
+
+thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
+	SLOT_COUNT :: 64
+
+	slots:= [SLOT_COUNT]Stress_Slot{}
+	rng := args.seed
+
+	args.result.ok = true
+	args.result.failed_op = -1
+	args.result.failure_code = 0
+
+	for op := 0; op < THREAD_OPS; op += 1 {
+		index := rand_range(&rng, SLOT_COUNT)
+		slot := &slots[index]
+
+		// Encourage more thread interleavings.
+		if (next_u64(&rng) & 7) == 0 {
+			thread.yield()
+		}
+
+		if !slot.live {
+			size := 1 + rand_range(&rng, 4096)
+			alignments := [?]int{1, 2, 4, 8, 16, 32, 64}
+			alignment := alignments[rand_range(&rng, len(alignments))]
+
+			buf, err := mem.alloc_bytes(size, alignment, args.allocator)
+			if err != .None || len(buf) != size {
+				args.result.ok = false
+				args.result.failed_op = op
+				args.result.failure_code = 1
+				return
+			}
+
+			ptr := rawptr(raw_data(buf))
+			if !mem.is_aligned(ptr, alignment) {
+				args.result.ok = false
+				args.result.failed_op = op
+				args.result.failure_code = 2
+				_ = mem.free_bytes(buf, args.allocator)
+				return
+			}
+
+			seed := u8(rand_range(&rng, 256))
+			fill_pattern(buf, seed)
+
+			slot.data = buf
+			slot.seed = seed
+			slot.live = true
+			slot.alignment = alignment
+		} else {
+			if !check_pattern(slot.data, slot.seed) {
+				args.result.ok = false
+				args.result.failed_op = op
+				args.result.failure_code = 3
+				return
+			}
+
+			action := rand_range(&rng, 3)
+
+			switch action {
+			case 0:
+				free_err := mem.free_bytes(slot.data, args.allocator)
+				if free_err != .None {
+					args.result.ok = false
+					args.result.failed_op = op
+					args.result.failure_code = 4
+					return
+				}
+
+				slot.data = nil
+				slot.live = false
+
+			case 1, 2:
+				old_len := len(slot.data)
+				new_len := 1 + rand_range(&rng, 4096)
+
+				resized, resize_err := mem.resize_bytes(
+					slot.data,
+					new_len,
+					slot.alignment,
+					args.allocator,
+				)
+
+				if resize_err != .None || len(resized) != new_len {
+					args.result.ok = false
+					args.result.failed_op = op
+					args.result.failure_code = 5
+					return
+				}
+
+				preserved := min(old_len, new_len)
+				if !check_pattern(resized[:preserved], slot.seed) {
+					args.result.ok = false
+					args.result.failed_op = op
+					args.result.failure_code = 6
+					return
+				}
+
+				slot.data = resized
+				slot.seed = u8(rand_range(&rng, 256))
+				fill_pattern(slot.data, slot.seed)
+			}
+		}
+	}
+
+	// Final validation and cleanup.
+	for &slot in slots {
+		if slot.live {
+			if !check_pattern(slot.data, slot.seed) {
+				args.result.ok = false
+				args.result.failed_op = THREAD_OPS
+				args.result.failure_code = 7
+				return
+			}
+
+			free_err := mem.free_bytes(slot.data, args.allocator)
+			if free_err != .None {
+				args.result.ok = false
+				args.result.failed_op = THREAD_OPS
+				args.result.failure_code = 8
+				return
+			}
+		}
+	}
+}
+
+test_allocator_thread_safety_stress :: proc(
+	t: ^testing.T,
+	allocator: mem.Allocator,
+) {
+	results: [THREAD_COUNT]Thread_Stress_Result
+	threads: [THREAD_COUNT]^thread.Thread
+
+	for i := 0; i < THREAD_COUNT; i += 1 {
+		args := Thread_Stress_Args{
+			allocator = allocator,
+			thread_index = i,
+			seed = t.seed ~ u64(i * 0x9E3779B9),
+			result = &results[i],
+		}
+
+		threads[i] = thread.create_and_start_with_poly_data(
+			args,
+			thread_allocator_stress_worker,
+		)
+	}
+
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+
+	for i := 0; i < THREAD_COUNT; i += 1 {
+		result := results[i]
+
+		testing.expectf(
+			t,
+			result.ok,
+			"thread safety stress failed: thread=%d, op=%d, failure_code=%d",
+			i,
+			result.failed_op,
+			result.failure_code,
+		)
+	}
+}
+
+
 //
 // Hook the generic suite to a specific allocator.
 // This example runs against the default context allocator.
 //
+
 @(test)
 default_allocator_basic :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
@@ -364,4 +551,10 @@ default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
 	test_allocator_randomized_resize_stress(t, context.allocator)
+}
+
+@(test)
+default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
+	
+	test_allocator_thread_safety_stress(t, runtime.heap_allocator())
 }
