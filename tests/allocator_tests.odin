@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:mem"
 import "core:testing"
 import "core:thread"
+import "core:log"
 
 // Tests were generated with the help of ChatGPT
 // https://chatgpt.com/s/t_6a040a670be88191b68fd3ff53e8210f

@@ -10,10 +10,9 @@ import "core:sync"
 Segregated_Free_List :: struct {
 	fallback_allocator: Allocator,
 	regions:            ^Segregated_Free_List_Region,
+	region_mutex:       sync.Mutex,
 	free_lists:         [SIZE_CLASS_COUNT]^Segregated_Free_Block,
-	used:               int,
-	peak_used:          int,
-	mutex:              sync.Mutex,
+	free_lists_mutex:   [SIZE_CLASS_COUNT]sync.Mutex,
 }
 
 Segregated_Free_List_Region :: struct {
@@ -50,8 +49,8 @@ segregated_free_list_init :: proc(
 	s.fallback_allocator = fallback_allocator
 	s.regions = nil
 	s.free_lists = {}
-	s.used = 0
-	s.peak_used = 0
+	s.region_mutex = {}
+	s.free_lists_mutex = {}
 }
 
 @(require_results)
@@ -110,9 +109,9 @@ segregated_free_list_destroy :: proc(s: ^Segregated_Free_List, loc := #caller_lo
 
 	s.regions = nil
 	s.free_lists = {}
-	s.used = 0
 	s.fallback_allocator = {}
-	s.mutex = {}
+	s.region_mutex = {}
+	s.free_lists_mutex = {}
 }
 
 @(require_results, no_sanitize_address)
@@ -125,8 +124,6 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 	[]byte,
 	Allocator_Error,
 ) {
-	sync.mutex_guard(&s.mutex)
-
 	if size == 0 {
 		return nil, nil
 	}
@@ -134,7 +131,7 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 		return nil, .Invalid_Argument
 	}
 
-	block, prev, class_index, used_size, padding := segregated_free_list_find_block(
+	block, prev, class_index, used_size, padding, lock := segregated_free_list_find_block(
 		s,
 		size,
 		alignment,
@@ -145,7 +142,7 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 			return nil, err
 		}
 
-		block, prev, class_index, used_size, padding = segregated_free_list_find_block(
+		block, prev, class_index, used_size, padding, lock = segregated_free_list_find_block(
 			s,
 			size,
 			alignment,
@@ -156,6 +153,7 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 	}
 
 	segregated_free_list_remove_free_block(s, class_index, prev, block)
+	sync.unlock(lock)
 
 	region := block.region
 
@@ -189,9 +187,6 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 	header.padding = padding
 	header.region = region
 
-	s.used += used_size
-	s.peak_used = max(s.peak_used, s.used)
-
 	return mem.byte_slice(rawptr(user_addr), size), nil
 }
 
@@ -201,8 +196,6 @@ segregated_free_list_free :: proc(
 	ptr: rawptr,
 	loc := #caller_location,
 ) -> Allocator_Error {
-	sync.mutex_guard(&s.mutex)
-
 	if ptr == nil {
 		return nil
 	}
@@ -242,11 +235,6 @@ segregated_free_list_free :: proc(
 	block.size = header.block_size
 	block.region = region
 	block.next = nil
-
-	s.used -= header.block_size
-	if s.used < 0 {
-		s.used = 0
-	}
 
 	block = segregated_free_list_coalesce(s, block)
 	segregated_free_list_insert_free_block(s, block)
@@ -424,6 +412,8 @@ segregated_free_list_add_region_for_request :: proc(
 	alignment: int,
 	loc := #caller_location,
 ) -> Allocator_Error {
+	sync.mutex_guard(&s.region_mutex)
+
 	minimum_allocation_size := size + size_of(Segregated_Free_List_Allocation_Header)
 	if alignment > 1 {
 		minimum_allocation_size += alignment - 1
@@ -495,6 +485,7 @@ segregated_free_list_find_block :: proc(
 	class_index: int,
 	used_size: int,
 	padding: int,
+	lock: ^sync.Mutex
 ) {
 	minimum_possible := size + size_of(Segregated_Free_List_Allocation_Header)
 	if alignment > 1 {
@@ -504,6 +495,9 @@ segregated_free_list_find_block :: proc(
 	start_class := segregated_free_list_class_index(minimum_possible)
 
 	for class in start_class ..< SIZE_CLASS_COUNT {
+		lock = &s.free_lists_mutex[class]
+		sync.lock(lock)
+		
 		prev = nil
 		block = s.free_lists[class]
 		for block != nil {
@@ -515,9 +509,11 @@ segregated_free_list_find_block :: proc(
 			prev = block
 			block = block.next
 		}
+
+		sync.unlock(lock)
 	}
 
-	return nil, nil, 0, 0, 0
+	return nil, nil, 0, 0, 0, nil
 }
 
 @(require_results)
@@ -575,10 +571,12 @@ segregated_free_list_insert_free_block :: proc(
 	block: ^Segregated_Free_Block,
 ) {
 	class_index := segregated_free_list_class_index(block.size)
+	sync.mutex_guard(&s.free_lists_mutex[class_index])
 	block.next = s.free_lists[class_index]
 	s.free_lists[class_index] = block
 }
 
+// the caller should handle locking the free list
 segregated_free_list_remove_free_block :: proc(
 	s: ^Segregated_Free_List,
 	class_index: int,
@@ -599,6 +597,8 @@ segregated_free_list_coalesce :: proc(
 	block: ^Segregated_Free_Block,
 ) -> ^Segregated_Free_Block {
 	for class_index in 0 ..< SIZE_CLASS_COUNT {
+		sync.mutex_guard(&s.free_lists_mutex[class_index])
+
 		prev: ^Segregated_Free_Block = nil
 		other := s.free_lists[class_index]
 
