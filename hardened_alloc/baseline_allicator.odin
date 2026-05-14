@@ -2,6 +2,7 @@ package hardened_alloc
 
 import "base:runtime"
 import "core:mem"
+import "core:log"
 
 // The following code is largely based on how some of the official Odin allocators
 // https://github.com/odin-lang/Odin/blob/16ebdc19dd1743d8432aefa55cbc847530399d4d/core/mem/allocators.odin
@@ -433,11 +434,9 @@ segregated_free_list_add_region_for_request :: proc(
 
 	region_alignment := max(align_of(Segregated_Free_List_Region), align_of(Segregated_Free_Block))
 
-	minimum_region_size := region_header_size + minimum_block_size
+	minimum_region_size := region_header_size + minimum_block_size + region_alignment - 1
 
 	region_allocation_size := max(DEFAULT_REGION_SIZE, minimum_region_size)
-
-	region_allocation_size += region_alignment - 1
 
 	raw_region_memory, memory_err := _request_memory(
 		region_allocation_size,
@@ -593,53 +592,36 @@ segregated_free_list_coalesce :: proc(
 	s: ^Segregated_Free_List,
 	block: ^Segregated_Free_Block,
 ) -> ^Segregated_Free_Block {
-	block := block
+	for class_index in 0 ..< SIZE_CLASS_COUNT {
+		prev: ^Segregated_Free_Block = nil
+		other := s.free_lists[class_index]
 
-	for {
-		merged := false
-
-		for class_index in 0 ..< SIZE_CLASS_COUNT {
-			prev: ^Segregated_Free_Block = nil
-			other := s.free_lists[class_index]
-
-			for other != nil {
-				if other.region != block.region {
-					prev = other
-					other = other.next
-					continue
-				}
-
-				block_start := uintptr(block)
-				block_end := block_start + uintptr(block.size)
-				other_start := uintptr(other)
-				other_end := other_start + uintptr(other.size)
-
-				if other_end == block_start {
-					segregated_free_list_remove_free_block(s, class_index, prev, other)
-					other.size += block.size
-					block = other
-					merged = true
-					break
-				}
-
-				if block_end == other_start {
-					segregated_free_list_remove_free_block(s, class_index, prev, other)
-					block.size += other.size
-					merged = true
-					break
-				}
-
+		for other != nil {
+			if other.region != block.region {
 				prev = other
 				other = other.next
+				continue
 			}
 
-			if merged {
-				break
-			}
-		}
+			block_start := uintptr(block)
+			block_end := block_start + uintptr(block.size)
+			other_start := uintptr(other)
+			other_end := other_start + uintptr(other.size)
 
-		if !merged {
-			break
+			if other_end == block_start {
+				segregated_free_list_remove_free_block(s, class_index, prev, other)
+				other.size += block.size
+				return other
+			}
+
+			if block_end == other_start {
+				segregated_free_list_remove_free_block(s, class_index, prev, other)
+				block.size += other.size
+				return block
+			}
+
+			prev = other
+			other = other.next
 		}
 	}
 
