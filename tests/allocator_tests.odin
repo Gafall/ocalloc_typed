@@ -558,3 +558,94 @@ default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 	test_allocator_thread_safety_stress(t, context.allocator)
 	//test_allocator_thread_safety_stress(t, runtime.heap_allocator())
 }
+
+@(test)
+hardened_allocator_basic :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_basic(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_zeroed_alloc :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_zeroed_alloc(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_alignment :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_alignment(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_pattern_fill :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_pattern_fill(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_resize_grow :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_resize_grow(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_resize_shrink :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_resize_shrink(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_randomized_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_randomized_stress(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_randomized_resize_stress(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_thread_safety_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_thread_safety_stress(t, context.allocator)
+	//test_allocator_thread_safety_stress(t, runtime.heap_allocator())
+}
