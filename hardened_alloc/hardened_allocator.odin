@@ -70,7 +70,19 @@ Type_Class :: enum {
 	Buffer, // for buffers
 	Pointer_Containing, // for things that have pointers
 	Procedure_Containing, // for things that have procedures
+	Sensitive, // for things considered sensitive
 	Opaque, // fallback for types that are hard to classify
+}
+
+Manual_Type_Entry :: struct {
+	id:    typeid,
+	class: Type_Class,
+}
+
+Manual_Type_Registry :: struct {
+	type_entries:       []Manual_Type_Entry,
+	fallback_class:     Type_Class,
+	use_fallback_class: bool,
 }
 
 Hardened_Allocator_Zone :: struct {
@@ -85,12 +97,12 @@ Hardened_Allocator :: struct {
 	metadata:           ^Hardened_Allocator_Metadata,
 }
 
-
 Hardened_Allocator_Metadata :: struct {
-	zones:             []^Hardened_Allocator_Zone,
-	type_class_policy: Type_Class_Policy,
-	type_bucket_count: int,
-	type_class_seed:   u64,
+	zones:                []^Hardened_Allocator_Zone,
+	type_class_policy:    Type_Class_Policy,
+	manual_type_registry: Manual_Type_Registry,
+	type_bucket_count:    int,
+	type_class_seed:      u64,
 }
 
 Hardened_Allocator_Region :: struct {
@@ -349,6 +361,7 @@ hardened_allocator_init_metadata :: proc(
 	type_bucket_count: int,
 	type_policy: Type_Class_Policy,
 	allocator: Allocator,
+	manual_type_registry: Manual_Type_Registry = {fallback_class = .Opaque},
 ) -> Allocator_Error {
 	s.fallback_allocator = allocator
 	raw, err := _request_memory(
@@ -375,6 +388,22 @@ hardened_allocator_init_metadata :: proc(
 		s.metadata.type_bucket_count = type_bucket_count
 
 	case .Manual_Registry:
+		if len(manual_type_registry.type_entries) < 1 {
+			return .Invalid_Argument
+		}
+		s.metadata.manual_type_registry.fallback_class = manual_type_registry.fallback_class
+		s.metadata.manual_type_registry.use_fallback_class = manual_type_registry.use_fallback_class
+		mtrerr: Allocator_Error
+		s.metadata.manual_type_registry.type_entries, mtrerr = hardened_allocator_alloc_slice(
+			Manual_Type_Entry,
+			len(manual_type_registry.type_entries),
+			s.fallback_allocator,
+		)
+		if mtrerr != nil {
+			return mtrerr
+		}
+
+		copy(s.metadata.manual_type_registry.type_entries, manual_type_registry.type_entries)
 		s.metadata.type_bucket_count = len(Type_Class)
 	}
 
@@ -390,14 +419,35 @@ hardened_allocator_init :: proc(
 	s: ^Hardened_Allocator,
 	fallback_allocator := context.allocator,
 	type_bucket_count := TYPE_BUCKET_COUNT,
-	type_policy := Type_Class_Policy.Type_Signature,
+	type_policy := Type_Class_Policy.Randomized_Type_Signature,
+	manual_type_registry: Manual_Type_Registry = {fallback_class = .Opaque},
 	loc := #caller_location,
 ) -> Allocator_Error {
 	if type_bucket_count < 1 {
 		return .Invalid_Argument
 	}
 
-	return hardened_allocator_init_metadata(s, type_bucket_count, type_policy, fallback_allocator)
+	return hardened_allocator_init_metadata(s, type_bucket_count, type_policy, fallback_allocator, manual_type_registry)
+}
+
+hardened_allocator_manual_registry_lookup :: proc(
+	s: ^Hardened_Allocator,
+	id: typeid,
+) -> (
+	Type_Class,
+	bool,
+) {
+	for entry in s.metadata.manual_type_registry.type_entries {
+		if entry.id == id {
+			return entry.class, true
+		}
+	}
+
+	if s.metadata.manual_type_registry.use_fallback_class {
+		return s.metadata.manual_type_registry.fallback_class, true
+	}
+
+	return nil, false
 }
 
 @(require_results)
@@ -409,8 +459,18 @@ hardened_allocator_alloc :: proc(
 ) -> (
 	rawptr,
 	Allocator_Error,
-) {
+) {	
 	sig := hardened_allocator_determine_type_signature(s, T)
+
+	if s.metadata.type_class_policy == .Manual_Registry {
+		type, found := hardened_allocator_manual_registry_lookup(s, T)
+		if !found {
+			return nil, .Invalid_Argument
+		}
+
+		sig.index = int(type)
+	}
+
 	bytes, err := hardened_allocator_alloc_bytes(s, &sig, size_of(T), alignment, loc)
 
 	return raw_data(bytes), err

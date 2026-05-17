@@ -219,7 +219,10 @@ stress_alloc_typed :: proc(
 	kind: Stress_Kind,
 	alignment: int,
 	allocator: mem.Allocator,
-) -> (rawptr, mem.Allocator_Error) {
+) -> (
+	rawptr,
+	mem.Allocator_Error,
+) {
 	switch kind {
 	case .Data_Block:
 		p, err := hardened_alloc.typed_new(Stress_Data_Block, alignment, allocator)
@@ -241,11 +244,7 @@ stress_alloc_typed :: proc(
 	return nil, .Invalid_Argument
 }
 
-stress_init_allocation :: proc(
-	ptr: rawptr,
-	kind: Stress_Kind,
-	seed: u8,
-) {
+stress_init_allocation :: proc(ptr: rawptr, kind: Stress_Kind, seed: u8) {
 	switch kind {
 	case .Data_Block:
 		block := cast(^Stress_Data_Block)ptr
@@ -273,35 +272,36 @@ stress_init_allocation :: proc(
 	}
 }
 
-stress_check_allocation :: proc(
-	ptr: rawptr,
-	kind: Stress_Kind,
-	seed: u8,
-) -> bool {
+stress_check_allocation :: proc(ptr: rawptr, kind: Stress_Kind, seed: u8) -> bool {
 	switch kind {
 	case .Data_Block:
 		block := cast(^Stress_Data_Block)ptr
-		return block.marker == 0xDADA_DADA_DADA_DADA &&
-		       check_pattern(block.data[:], seed)
+		return block.marker == 0xDADA_DADA_DADA_DADA && check_pattern(block.data[:], seed)
 
 	case .Pointer_Block:
 		block := cast(^Stress_Pointer_Block)ptr
-		return block.marker == 0xBEEF_BEEF_BEEF_BEEF &&
-		       block.next == nil &&
-		       check_pattern(block.data[:], seed)
+		return(
+			block.marker == 0xBEEF_BEEF_BEEF_BEEF &&
+			block.next == nil &&
+			check_pattern(block.data[:], seed) \
+		)
 
 	case .Procedure_Block:
 		block := cast(^Stress_Procedure_Block)ptr
-		return block.marker == 0xABCD_ABCD_ABCD_ABCD &&
-		       block.callback == nil &&
-		       check_pattern(block.data[:], seed)
+		return(
+			block.marker == 0xABCD_ABCD_ABCD_ABCD &&
+			block.callback == nil &&
+			check_pattern(block.data[:], seed) \
+		)
 
 	case .Mixed_Block:
 		block := cast(^Stress_Mixed_Block)ptr
-		return block.marker == 0xFACE_FACE_FACE_FACE &&
-		       block.next == nil &&
-		       block.count == 0x1234_5678 &&
-		       check_pattern(block.data[:], seed)
+		return(
+			block.marker == 0xFACE_FACE_FACE_FACE &&
+			block.next == nil &&
+			block.count == 0x1234_5678 &&
+			check_pattern(block.data[:], seed) \
+		)
 	}
 
 	return false
@@ -310,9 +310,10 @@ stress_check_allocation :: proc(
 test_allocator_randomized_stress :: proc(
 	t: ^testing.T,
 	allocator: mem.Allocator,
+	all: ^hardened_alloc.Hardened_Allocator = nil,
 ) {
 	SLOT_COUNT :: 512
-	OPS        :: 5000
+	OPS :: 5000
 
 	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := t.seed
@@ -329,6 +330,35 @@ test_allocator_randomized_stress :: proc(
 
 			ptr, err := stress_alloc_typed(kind, alignment, allocator)
 			if err != .None || ptr == nil {
+				if err == .Invalid_Argument && all != nil {
+					found := false
+					switch kind {
+					case .Data_Block:
+						_, found = hardened_alloc.hardened_allocator_manual_registry_lookup(
+							all,
+							Stress_Procedure_Block,
+						)
+					case .Pointer_Block:
+						_, found = hardened_alloc.hardened_allocator_manual_registry_lookup(
+							all,
+							Stress_Pointer_Block,
+						)
+					case .Procedure_Block:
+						_, found = hardened_alloc.hardened_allocator_manual_registry_lookup(
+							all,
+							Stress_Procedure_Block,
+						)
+					case .Mixed_Block:
+						_, found = hardened_alloc.hardened_allocator_manual_registry_lookup(
+							all,
+							Stress_Mixed_Block,
+						)
+					}
+
+					if !found {
+						continue
+					}
+				}
 				testing.expectf(
 					t,
 					false,
@@ -556,11 +586,7 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 				new_kind := Stress_Kind(rand_range(&rng, STRESS_KIND_COUNT))
 				new_alignment := alignments[rand_range(&rng, len(alignments))]
 
-				new_ptr, alloc_err := stress_alloc_typed(
-					new_kind,
-					new_alignment,
-					args.allocator,
-				)
+				new_ptr, alloc_err := stress_alloc_typed(new_kind, new_alignment, args.allocator)
 				if alloc_err != .None || new_ptr == nil {
 					args.result.ok = false
 					args.result.failed_op = op
@@ -832,6 +858,80 @@ hardened_allocator_randomized_stress :: proc(t: ^testing.T) {
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
 	test_allocator_randomized_stress(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_manual_registry_randomized_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	manual_registry: hardened_alloc.Manual_Type_Registry = {
+		type_entries       = {
+			hardened_alloc.manual_entry(Stress_Pointer_Block, .Pointer_Containing),
+			hardened_alloc.manual_entry(Stress_Mixed_Block, .Opaque),
+			hardened_alloc.manual_entry(Stress_Procedure_Block, .Procedure_Containing),
+			hardened_alloc.manual_entry(Stress_Data_Block, .Data),
+		},
+		fallback_class     = .Opaque,
+		use_fallback_class = false,
+	}
+	hardened_alloc.hardened_allocator_init(
+		&all,
+		context.allocator,
+		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
+		manual_type_registry = manual_registry,
+	)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_randomized_stress(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_manual_registry_fallback_randomized_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	manual_registry: hardened_alloc.Manual_Type_Registry = {
+		type_entries       = {
+			hardened_alloc.manual_entry(Stress_Pointer_Block, .Pointer_Containing),
+			hardened_alloc.manual_entry(Stress_Procedure_Block, .Procedure_Containing),
+			hardened_alloc.manual_entry(Stress_Data_Block, .Data),
+		},
+		fallback_class     = .Opaque,
+		use_fallback_class = true,
+	}
+	hardened_alloc.hardened_allocator_init(
+		&all,
+		context.allocator,
+		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
+		manual_type_registry = manual_registry,
+	)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_randomized_stress(t, context.allocator)
+}
+
+@(test)
+hardened_allocator_manual_registry_failure_randomized_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	manual_registry: hardened_alloc.Manual_Type_Registry = {
+		type_entries       = {
+			hardened_alloc.manual_entry(Stress_Pointer_Block, .Pointer_Containing),
+			hardened_alloc.manual_entry(Stress_Procedure_Block, .Procedure_Containing),
+			hardened_alloc.manual_entry(Stress_Data_Block, .Data),
+		},
+		fallback_class     = .Opaque,
+		use_fallback_class = false,
+	}
+	hardened_alloc.hardened_allocator_init(
+		&all,
+		context.allocator,
+		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
+		manual_type_registry = manual_registry,
+	)
+
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+	context.allocator = hardened_alloc.hardened_allocator(&all)
+
+	test_allocator_randomized_stress(t, context.allocator, &all)
 }
 
 @(test)
