@@ -2,6 +2,8 @@ package hardened_alloc
 
 import "base:runtime"
 import "core:mem"
+import "core:mem/virtual"
+
 
 Allocator :: runtime.Allocator
 Allocator_Error :: runtime.Allocator_Error
@@ -15,12 +17,36 @@ SIZE_CLASS_COUNT :: 16
 TYPE_BUCKET_COUNT :: 16
 MIN_SIZE_CLASS :: 32
 MIN_SPLIT_PAYLOAD :: 16
-DEFAULT_REGION_SIZE :: mem.DEFAULT_PAGE_SIZE * 8
+DEFAULT_REGION_SIZE :: mem.DEFAULT_PAGE_SIZE * 4
 MAX_RECURSION_DEPTH :: 16
 DEFAULT_QUARANTINE_SIZE :: 10
 
 manual_entry :: proc($T: typeid, class: Type_Class) -> Manual_Type_Entry {
 	return Manual_Type_Entry{id = typeid_of(T), class = class}
+}
+
+_free_memory :: proc(bytes: []byte) -> Allocator_Error {
+	virtual.release(raw_data(bytes), uint(len(bytes)))
+	return nil
+}
+
+@(require_results)
+_request_memory :: proc "contextless" (
+	size: int,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	if size <= 0 {
+		return nil, nil
+	}
+
+	bytes, err := virtual.reserve_and_commit(uint(size))
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes, nil
 }
 
 

@@ -104,7 +104,7 @@ segregated_free_list_destroy :: proc(s: ^Segregated_Free_List, loc := #caller_lo
 	for region != nil {
 		next := region.next
 
-		_free_memory(region.memory, s.fallback_allocator)
+		_free_memory(region.memory)
 		region = next
 	}
 
@@ -439,8 +439,6 @@ segregated_free_list_add_region_for_request :: proc(
 
 	raw_region_memory, memory_err := _request_memory(
 		region_allocation_size,
-		region_alignment,
-		s.fallback_allocator,
 	)
 	if memory_err != nil {
 		return memory_err
@@ -502,7 +500,7 @@ segregated_free_list_find_block :: proc(
 		sync.lock(lock)
 		prev = nil
 		block = s.free_lists[class]
-		
+
 		for block != nil {
 			used_size, padding = segregated_free_list_required_block_size(block, size, alignment)
 			if used_size <= block.size {

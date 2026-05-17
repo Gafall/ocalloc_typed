@@ -97,8 +97,7 @@ Hardened_Allocator_Zone :: struct {
 }
 
 Hardened_Allocator :: struct {
-	fallback_allocator: Allocator, // used for allocating regions on some OS
-	metadata:           ^Hardened_Allocator_Metadata,
+	metadata: ^Hardened_Allocator_Metadata,
 }
 
 Hardened_Allocator_Metadata :: struct {
@@ -141,15 +140,8 @@ hardened_allocator :: proc(s: ^Hardened_Allocator) -> Allocator {
 }
 
 @(require_results)
-hardened_allocator_alloc_slice :: proc(
-	$T: typeid,
-	count: int,
-	allocator: Allocator,
-) -> (
-	[]T,
-	Allocator_Error,
-) {
-	raw, err := _request_memory(count * size_of(T), align_of(T), allocator)
+hardened_allocator_alloc_slice :: proc($T: typeid, count: int) -> ([]T, Allocator_Error) {
+	raw, err := _request_memory(count * size_of(T))
 	if err != nil || raw == nil {
 		return nil, err
 	}
@@ -160,18 +152,14 @@ hardened_allocator_alloc_slice :: proc(
 	return temp, nil
 }
 
-hardened_allocator_free_slice :: proc(
-	$T: typeid,
-	s: []T,
-	allocator: Allocator,
-) -> Allocator_Error {
+hardened_allocator_free_slice :: proc($T: typeid, s: []T) -> Allocator_Error {
 	if s == nil {
 		return nil
 	}
 
 	raw := slice.from_ptr(cast(^u8)raw_data(s), len(s) * size_of(T))
 
-	return _free_memory(raw, allocator)
+	return _free_memory(raw)
 }
 
 hardened_allocator_determine_type_signature :: proc(
@@ -301,13 +289,8 @@ hardened_allocator_alloc_zone :: proc(
 	s: ^Hardened_Allocator,
 	zone: ^^Hardened_Allocator_Zone,
 	zone_index: int,
-	allocator: Allocator,
 ) -> Allocator_Error {
-	raw, err := _request_memory(
-		size_of(Hardened_Allocator_Zone),
-		align_of(Hardened_Allocator_Zone),
-		allocator,
-	)
+	raw, err := _request_memory(size_of(Hardened_Allocator_Zone))
 	if err != nil {
 		return err
 	}
@@ -320,7 +303,6 @@ hardened_allocator_alloc_zone :: proc(
 	zone^.free_lists, ferr = hardened_allocator_alloc_slice(
 		^Hardened_Allocator_Free_Block,
 		s.metadata.size_class_count,
-		allocator,
 	)
 	if ferr != nil {
 		return ferr
@@ -330,7 +312,6 @@ hardened_allocator_alloc_zone :: proc(
 	zone^.free_lists_mutex, mferr = hardened_allocator_alloc_slice(
 		sync.Mutex,
 		s.metadata.size_class_count,
-		allocator,
 	)
 	if mferr != nil {
 		return mferr
@@ -340,7 +321,6 @@ hardened_allocator_alloc_zone :: proc(
 	zone^.quarantine, qerr = hardened_allocator_alloc_slice(
 		^Hardened_Allocator_Free_Block,
 		s.metadata.quarantine_size,
-		allocator,
 	)
 
 	return nil
@@ -352,14 +332,13 @@ hardened_allocator_init_zones :: proc(s: ^Hardened_Allocator) -> Allocator_Error
 	s.metadata.zones, zerr = hardened_allocator_alloc_slice(
 		^Hardened_Allocator_Zone,
 		s.metadata.type_bucket_count,
-		s.fallback_allocator,
 	)
 	if zerr != nil {
 		return zerr
 	}
 
 	for &zone, index in s.metadata.zones {
-		zaerr := hardened_allocator_alloc_zone(s, &zone, index, s.fallback_allocator)
+		zaerr := hardened_allocator_alloc_zone(s, &zone, index)
 		if zaerr != nil {
 			return zaerr
 		}
@@ -379,12 +358,7 @@ hardened_allocator_init_metadata :: proc(
 	allocator: Allocator,
 	manual_type_registry: Manual_Type_Registry = {fallback_class = .Opaque},
 ) -> Allocator_Error {
-	s.fallback_allocator = allocator
-	raw, err := _request_memory(
-		size_of(Hardened_Allocator_Metadata),
-		align_of(Hardened_Allocator_Metadata),
-		allocator,
-	)
+	raw, err := _request_memory(size_of(Hardened_Allocator_Metadata))
 	if err != nil {
 		return err
 	}
@@ -416,7 +390,6 @@ hardened_allocator_init_metadata :: proc(
 		s.metadata.manual_type_registry.type_entries, mtrerr = hardened_allocator_alloc_slice(
 			Manual_Type_Entry,
 			len(manual_type_registry.type_entries),
-			s.fallback_allocator,
 		)
 		if mtrerr != nil {
 			return mtrerr
@@ -544,39 +517,23 @@ hardened_allocator_destroy :: proc(s: ^Hardened_Allocator, loc := #caller_locati
 		for region != nil {
 			next := region.next
 
-			_free_memory(region.memory, s.fallback_allocator)
+			_free_memory(region.memory)
 			region = next
 		}
 
 		zone.region_list = nil
 		zone.region_mutex = {}
-		hardened_allocator_free_slice(
-			^Hardened_Allocator_Free_Block,
-			zone.free_lists,
-			s.fallback_allocator,
-		)
-		hardened_allocator_free_slice(sync.Mutex, zone.free_lists_mutex, s.fallback_allocator)
-		hardened_allocator_free_slice(
-			^Hardened_Allocator_Free_Block,
-			zone.quarantine,
-			s.fallback_allocator,
-		)
+		hardened_allocator_free_slice(^Hardened_Allocator_Free_Block, zone.free_lists)
+		hardened_allocator_free_slice(sync.Mutex, zone.free_lists_mutex)
+		hardened_allocator_free_slice(^Hardened_Allocator_Free_Block, zone.quarantine)
 
-		_free_memory(
-			slice.bytes_from_ptr(zone, size_of(Hardened_Allocator_Zone)),
-			s.fallback_allocator,
-		)
+		_free_memory(slice.bytes_from_ptr(zone, size_of(Hardened_Allocator_Zone)))
 	}
 
-	hardened_allocator_free_slice(^Hardened_Allocator_Zone, s.metadata.zones, s.fallback_allocator)
-	hardened_allocator_free_slice(Manual_Type_Entry, s.metadata.manual_type_registry.type_entries, s.fallback_allocator)
+	hardened_allocator_free_slice(^Hardened_Allocator_Zone, s.metadata.zones)
+	hardened_allocator_free_slice(Manual_Type_Entry, s.metadata.manual_type_registry.type_entries)
 
-	_free_memory(
-		slice.bytes_from_ptr(s.metadata, size_of(Hardened_Allocator_Metadata)),
-		s.fallback_allocator,
-	)
-
-	s.fallback_allocator = {}
+	_free_memory(slice.bytes_from_ptr(s.metadata, size_of(Hardened_Allocator_Metadata)))
 }
 
 @(require_results, no_sanitize_address)
@@ -603,7 +560,7 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 	used_size: int
 	padding: int
 	lock: ^sync.Mutex
-	
+
 	for {
 		block, prev, size_index, used_size, padding, lock = hardened_allocator_find_block(
 			s,
@@ -843,11 +800,7 @@ hardened_allocator_add_region_for_request :: proc(
 
 	region_allocation_size := max(DEFAULT_REGION_SIZE, minimum_region_size)
 
-	raw_region_memory, memory_err := _request_memory(
-		region_allocation_size,
-		region_alignment,
-		s.fallback_allocator,
-	)
+	raw_region_memory, memory_err := _request_memory(region_allocation_size)
 	if memory_err != nil {
 		return memory_err
 	}
