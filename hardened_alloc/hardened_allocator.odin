@@ -569,6 +569,7 @@ hardened_allocator_destroy :: proc(s: ^Hardened_Allocator, loc := #caller_locati
 	}
 
 	hardened_allocator_free_slice(^Hardened_Allocator_Zone, s.metadata.zones, s.fallback_allocator)
+	hardened_allocator_free_slice(Manual_Type_Entry, s.metadata.manual_type_registry.type_entries, s.fallback_allocator)
 
 	_free_memory(
 		slice.bytes_from_ptr(s.metadata, size_of(Hardened_Allocator_Metadata)),
