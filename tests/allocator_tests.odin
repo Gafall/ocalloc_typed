@@ -313,7 +313,7 @@ test_allocator_randomized_stress :: proc(
 	all: ^hardened_alloc.Hardened_Allocator = nil,
 ) {
 	SLOT_COUNT :: 512
-	OPS :: 5000
+	OPS :: 5000000
 
 	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := t.seed
@@ -678,7 +678,7 @@ test_allocator_thread_safety_stress :: proc(t: ^testing.T, allocator: mem.Alloca
 @(test)
 baseline_allocator_basic :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -688,7 +688,7 @@ baseline_allocator_basic :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -698,7 +698,7 @@ baseline_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_alignment :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -708,7 +708,7 @@ baseline_allocator_alignment :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_pattern_fill :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -718,7 +718,7 @@ baseline_allocator_pattern_fill :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_resize_grow :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -728,7 +728,7 @@ baseline_allocator_resize_grow :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_resize_shrink :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -738,7 +738,7 @@ baseline_allocator_resize_shrink :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_randomized_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -748,7 +748,7 @@ baseline_allocator_randomized_stress :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -758,7 +758,7 @@ baseline_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 @(test)
 baseline_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
-	hardened_alloc.segregated_free_list_init(&all, context.allocator)
+	hardened_alloc.segregated_free_list_init(&all)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
@@ -813,7 +813,7 @@ default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 @(test)
 hardened_allocator_basic :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
@@ -823,7 +823,7 @@ hardened_allocator_basic :: proc(t: ^testing.T) {
 @(test)
 hardened_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
@@ -833,7 +833,7 @@ hardened_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 @(test)
 hardened_allocator_alignment :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
@@ -843,7 +843,7 @@ hardened_allocator_alignment :: proc(t: ^testing.T) {
 @(test)
 hardened_allocator_pattern_fill :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
@@ -853,7 +853,7 @@ hardened_allocator_pattern_fill :: proc(t: ^testing.T) {
 @(test)
 hardened_allocator_randomized_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
 
@@ -875,9 +875,9 @@ hardened_allocator_manual_registry_randomized_stress :: proc(t: ^testing.T) {
 	}
 	hardened_alloc.hardened_allocator_init(
 		&all,
-		context.allocator,
 		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
 		manual_type_registry = manual_registry,
+		validate_allocator = false,
 	)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
@@ -899,9 +899,9 @@ hardened_allocator_manual_registry_fallback_randomized_stress :: proc(t: ^testin
 	}
 	hardened_alloc.hardened_allocator_init(
 		&all,
-		context.allocator,
 		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
 		manual_type_registry = manual_registry,
+		validate_allocator = false,
 	)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 	context.allocator = hardened_alloc.hardened_allocator(&all)
@@ -923,9 +923,9 @@ hardened_allocator_manual_registry_failure_randomized_stress :: proc(t: ^testing
 	}
 	hardened_alloc.hardened_allocator_init(
 		&all,
-		context.allocator,
 		type_policy = hardened_alloc.Type_Class_Policy.Manual_Registry,
 		manual_type_registry = manual_registry,
+		validate_allocator = false,
 	)
 
 	defer hardened_alloc.hardened_allocator_destroy(&all)
@@ -937,7 +937,16 @@ hardened_allocator_manual_registry_failure_randomized_stress :: proc(t: ^testing
 @(test)
 hardened_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = false)
+	defer hardened_alloc.hardened_allocator_destroy(&all)
+
+	test_allocator_thread_safety_stress(t, hardened_alloc.hardened_allocator(&all))
+}
+
+@(test)
+hardened_allocator_validation_stress :: proc(t: ^testing.T) {
+	all: hardened_alloc.Hardened_Allocator
+	hardened_alloc.hardened_allocator_init(&all, validate_allocator = true)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
 
 	test_allocator_thread_safety_stress(t, hardened_alloc.hardened_allocator(&all))

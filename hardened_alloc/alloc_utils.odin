@@ -21,6 +21,26 @@ DEFAULT_REGION_SIZE :: mem.DEFAULT_PAGE_SIZE * 4
 MAX_RECURSION_DEPTH :: 16
 DEFAULT_QUARANTINE_SIZE :: 10
 
+typed_new :: proc(
+	$T: typeid,
+	alignment := align_of(T),
+	allocator := context.allocator,
+	loc := #caller_location,
+) -> (
+	^T,
+	Allocator_Error,
+) {
+	if allocator.procedure == hardened_allocator_proc {
+		raw, err := hardened_allocator_alloc(cast(^Hardened_Allocator)allocator.data, T, alignment)
+		if err != nil {
+			return nil, err
+		}
+		return cast(^T)raw, nil
+	}
+	return mem.new_aligned(T, alignment, allocator, loc)
+
+}
+
 manual_entry :: proc($T: typeid, class: Type_Class) -> Manual_Type_Entry {
 	return Manual_Type_Entry{id = typeid_of(T), class = class}
 }
@@ -31,12 +51,7 @@ _free_memory :: proc(bytes: []byte) -> Allocator_Error {
 }
 
 @(require_results)
-_request_memory :: proc "contextless" (
-	size: int,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
+_request_memory :: proc "contextless" (size: int) -> ([]byte, mem.Allocator_Error) {
 	if size <= 0 {
 		return nil, nil
 	}
