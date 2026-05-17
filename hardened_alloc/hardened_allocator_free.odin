@@ -48,7 +48,7 @@ hardened_allocator_quarantine :: proc(
 	hardened_allocator_check_zone(zone, s.metadata.secrets)
 	sync.mutex_guard(&zone.quarantine_mutex)
 	if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-		panic("Free list block was corrupted")
+		panic("Free list block was invalid")
 	}
 
 	if zone.quarantine_count + 1 <= s.metadata.quarantine_size {
@@ -65,7 +65,7 @@ hardened_allocator_quarantine :: proc(
 	zone.quarantine[index] = block
 
 	if !hardened_allocator_validate_free_block(other, s.metadata.secrets) {
-		panic("Free list block was corrupted in quarantine")
+		panic("Free list block was invalid in quarantine")
 	}
 	return other
 }
@@ -86,14 +86,14 @@ hardened_allocator_free :: proc(
 	}
 
 	if !hardened_allocator_validate_metadata(s.metadata, s.metadata.secrets) {
-		panic("Allocator state was corrupted")
+		panic("Allocator state was invalid")
 	}
 
 	user_addr := uintptr(ptr)
 	header_addr := user_addr - uintptr(size_of(Hardened_Allocator_Allocation_Header))
 	header := (^Hardened_Allocator_Allocation_Header)(rawptr(header_addr))
 	if !hardened_allocator_validate_allocation_header(header, s.metadata.secrets) {
-		panic("Allocated block was corrupted")
+		panic("Allocated block was invalid")
 	}
 
 	region := header.region
@@ -145,7 +145,7 @@ hardened_allocator_free :: proc(
 
 	if block != nil {
 		if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-			panic("Free block was corrupted after quarantine")
+			panic("Free block was invalid after quarantine")
 		}
 		block = hardened_allocator_coalesce(s, zone, block)
 		hardened_allocator_tag_free_block(block, s.metadata.secrets)
@@ -162,7 +162,7 @@ hardened_allocator_coalesce :: proc(
 	block: ^Hardened_Allocator_Free_Block,
 ) -> ^Hardened_Allocator_Free_Block {
 	if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-		panic("Free list block was corrupted")
+		panic("Free list block was invalid")
 	}
 	if !hardened_allocator_validate_region(block.region, s.metadata.secrets) {
 		panic("A memory region has been corrutped")
@@ -176,7 +176,7 @@ hardened_allocator_coalesce :: proc(
 
 		for other != nil {
 			if !hardened_allocator_validate_free_block(other, s.metadata.secrets) {
-				panic("Free list block was corrupted")
+				panic("Free list block was invalid")
 			}
 			if other.region != block.region {
 				prev = other

@@ -2,13 +2,12 @@ package allocator_tests
 
 import "../hardened_alloc"
 import "base:runtime"
-import "core:log"
 import "core:mem"
 import "core:testing"
 import "core:thread"
 
 // Tests were generated with the help of ChatGPT
-// https://chatgpt.com/s/t_6a095861df908191839e3f875287e916
+// https://chatgpt.com/share/6a0a2512-6164-83eb-a076-34577bd7648b
 
 //
 // Small deterministic RNG for randomized stress tests.

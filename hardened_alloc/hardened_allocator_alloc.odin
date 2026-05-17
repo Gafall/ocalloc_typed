@@ -52,7 +52,7 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 
 		if block != nil {
 			if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-				panic("Free list block was corrupted")
+				panic("Free list block was invalid")
 			}
 			zone := s.metadata.zones[sig.index]
 			hardened_allocator_check_zone(zone, s.metadata.secrets)
@@ -166,7 +166,7 @@ hardened_allocator_alloc :: proc(
 		panic("Allocator was never initialized")
 	}
 	if !hardened_allocator_validate_metadata(s.metadata, s.metadata.secrets) {
-		panic("Allocator state was corrupted")
+		panic("Allocator state was invalid")
 	}
 
 	sig := hardened_allocator_determine_type_signature(s, T)
@@ -268,7 +268,7 @@ hardened_allocator_alloc_region :: proc(
 
 	if zone.region_list != nil {
 		if !hardened_allocator_validate_region(zone.region_list, s.metadata.secrets) {
-			panic("A memory region has been corrupted")
+			panic("A memory region has been invalid")
 		}
 	}
 

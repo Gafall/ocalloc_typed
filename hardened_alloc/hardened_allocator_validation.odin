@@ -211,6 +211,6 @@ hardened_allocator_check_zone :: proc(
 	sync.mutex_guard(&zone.tag_mutex)
 
 	if !hardened_allocator_validate_zone(zone, secrets) {
-		panic("Allocator zone has been corrupted")
+		panic("Allocator zone has been invalid")
 	}
 }

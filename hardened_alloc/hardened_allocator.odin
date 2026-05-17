@@ -197,7 +197,7 @@ hardened_allocator_find_block :: proc(
 		block = zone.free_lists[size_class_index]
 		for block != nil {
 			if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-				panic("Free list block was corrupted")
+				panic("Free list block was invalid while traversing free list")
 			}
 			used_size, padding = hardened_allocator_required_block_size(block, size, alignment)
 			if used_size <= block.size {
@@ -270,7 +270,7 @@ hardened_allocator_insert_free_block :: proc(
 	block: ^Hardened_Allocator_Free_Block,
 ) {
 	if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-		panic("Free list block was corrupted")
+		panic("Free list block was invalid")
 	}
 	size_index := hardened_allocator_class_index(s, block.size)
 	zone := s.metadata.zones[sig.index]
@@ -293,7 +293,7 @@ hardened_allocator_remove_free_block :: proc(
 	block: ^Hardened_Allocator_Free_Block,
 ) {
 	if !hardened_allocator_validate_free_block(block, s.metadata.secrets) {
-		panic("Free list block was corrutped")
+		panic("Free list block was invalid")
 	}
 	hardened_allocator_check_zone(zone, s.metadata.secrets)
 	if prev == nil {
@@ -302,7 +302,7 @@ hardened_allocator_remove_free_block :: proc(
 		hardened_allocator_tag_zone(zone, s.metadata.secrets)
 	} else {
 		if !hardened_allocator_validate_free_block(prev, s.metadata.secrets) {
-			panic("Free list block was corrutped")
+			panic("Free list block was invalid")
 		}
 		prev.next = block.next
 		hardened_allocator_tag_free_block(prev, s.metadata.secrets)
