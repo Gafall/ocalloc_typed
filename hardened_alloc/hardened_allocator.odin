@@ -1,6 +1,7 @@
 package hardened_alloc
 
 import "base:runtime"
+import "core:crypto"
 import "core:mem"
 import "core:reflect"
 import "core:slice"
@@ -9,8 +10,9 @@ import "core:sync"
 // The following code is largely based on how some of the official Odin allocators
 // https://github.com/odin-lang/Odin/blob/16ebdc19dd1743d8432aefa55cbc847530399d4d/core/mem/allocators.odin
 
-new_typed :: proc(
+typed_new :: proc(
 	$T: typeid,
+	alignment := align_of(T),
 	allocator := context.allocator,
 	loc := #caller_location,
 ) -> (
@@ -18,14 +20,20 @@ new_typed :: proc(
 	Allocator_Error,
 ) {
 	if allocator.procedure == hardened_allocator_proc {
-		return hardened_allocator_alloc(allocator.data, T)
+		raw, err := hardened_allocator_alloc(cast(^Hardened_Allocator)allocator.data, T, alignment)
+		if err != nil {
+			return nil, err
+		}
+		return cast(^T)raw, nil
 	}
-	return new(T, allocator, loc)
+	return mem.new_aligned(T, alignment, allocator, loc)
+
 }
 
 Type_Signature :: struct {
 	hash:     u64,
 	features: bit_set[Signature_Feature],
+	index:    int,
 }
 
 Signature_Token :: enum {
@@ -42,15 +50,19 @@ Signature_Token :: enum {
 }
 
 Signature_Feature :: enum {
-	Has_Pointer,
-	Has_Procedure,
-	Has_Buffer,
-	Has_Opaque,
+	Is_Pointer,
+	Is_Procedure,
+	Is_Buffer,
+	Is_Opaque,
+	Is_Array,
+	Is_Struct,
+	Is_Data,
 }
 
 Type_Class_Policy :: enum {
 	Manual_Registry,
 	Type_Signature,
+	Randomized_Type_Signature,
 }
 
 Type_Class :: enum {
@@ -61,18 +73,31 @@ Type_Class :: enum {
 	Opaque, // fallback for types that are hard to classify
 }
 
+Hardened_Allocator_Zone :: struct {
+	region_list:      ^Hardened_Allocator_Region,
+	region_mutex:     sync.Mutex,
+	free_lists:       []^Hardened_Allocator_Free_Block,
+	free_lists_mutex: []sync.Mutex,
+}
+
 Hardened_Allocator :: struct {
 	fallback_allocator: Allocator, // used for allocating regions on some OS
-	regions:            ^Hardened_Allocator_Region,
-	region_mutex:       sync.Mutex,
-	free_lists:         []^Hardened_Allocator_Free_Block,
-	free_lists_mutex:   []sync.Mutex,
-	type_class_policy:  Type_Class_Policy,
+	metadata:           ^Hardened_Allocator_Metadata,
+}
+
+
+Hardened_Allocator_Metadata :: struct {
+	zones:             []^Hardened_Allocator_Zone,
+	type_class_policy: Type_Class_Policy,
+	type_bucket_count: int,
+	type_class_seed:   u64,
 }
 
 Hardened_Allocator_Region :: struct {
 	next:         ^Hardened_Allocator_Region,
+	zone:         ^Hardened_Allocator_Zone,
 	memory:       []byte,
+	type_index:   int,
 	usable_start: rawptr,
 	usable_size:  int,
 }
@@ -88,6 +113,7 @@ Hardened_Allocator_Allocation_Header :: struct #align (align_of(uintptr)) {
 	requested_size: int,
 	alignment:      int,
 	padding:        int,
+	sig:            Type_Signature,
 	region:         ^Hardened_Allocator_Region,
 }
 
@@ -96,6 +122,7 @@ hardened_allocator :: proc(s: ^Hardened_Allocator) -> Allocator {
 	return Allocator{procedure = hardened_allocator_proc, data = s}
 }
 
+@(require_results)
 hardened_allocator_alloc_slice :: proc(
 	$T: typeid,
 	count: int,
@@ -129,61 +156,74 @@ hardened_allocator_free_slice :: proc(
 	return _free_memory(raw, allocator)
 }
 
-hardened_allocator_determine_type_signature :: proc($T: typeid) -> Type_Signature {
+hardened_allocator_determine_type_signature :: proc(
+	s: ^Hardened_Allocator,
+	$T: typeid,
+) -> Type_Signature {
 	sig := Type_Signature{}
 
 	hardened_allocator_generate_signature(T, &sig, 0)
 
+	sig.hash = sig.hash ~ s.metadata.type_class_seed
+	sig.index = int(sig.hash % u64(s.metadata.type_bucket_count))
+
 	return sig
 }
 
-hardened_allocator_generate_signature :: proc($T: typeid, sig: ^Type_Signature, depth: int) {
+hardened_allocator_generate_signature :: proc(T: typeid, sig: ^Type_Signature, depth: int) {
 	if depth >= MAX_RECURSION_DEPTH {
-		sig.truncated = true
-		sig.features += {.Has_Opaque}
+		sig.features += {.Is_Opaque}
 		hash_add_token(&sig.hash, .Opaque)
 		hash_add_token(&sig.hash, .Truncated)
 		return
 	}
 
 	info := type_info_of(T)
-	base := reflect.type_info_base(T)
+	base := reflect.type_info_base(info)
+
+	hash_add_int(&sig.hash, base.size)
 
 	if reflect.is_procedure(base) {
-		sig.features += {.Has_Procedure}
+		if depth == 0 do sig.features += {.Is_Procedure}
 		hash_add_token(&sig.hash, .Procedure)
 		return
 	}
 
 	if reflect.is_pointer(base) || reflect.is_multi_pointer(base) || reflect.is_soa_pointer(base) {
-		sig.features += {.Has_Pointer}
+		if depth == 0 do sig.features += {.Is_Pointer}
 		hash_add_token(&sig.hash, .Pointer)
 		return
 	}
 
 	if reflect.is_string(base) {
-		sig.features += {.Has_Buffer}
+		if depth == 0 do sig.features += {.Is_Buffer}
 		hash_add_token(&sig.hash, .Buffer)
 		return
 	}
 
 	if reflect.is_slice(base) || reflect.is_dynamic_array(base) {
-		sig.features += {.Has_Pointer}
-		sig.features += {.Has_Buffer}
+		if depth == 0 {
+			sig.features += {.Is_Pointer}
+			sig.features += {.Is_Buffer}
+		}
+
 		hash_add_token(&sig.hash, .Pointer)
 		hash_add_token(&sig.hash, .Buffer)
 		return
 	}
 	if reflect.is_any(base) || reflect.is_dynamic_map(base) {
-		sig.features += {.Has_Pointer}
-		sig.features += {.Has_Opaque}
+		if depth == 0 {
+			sig.features += {.Is_Pointer}
+			sig.features += {.Is_Opaque}
+		}
+
 		hash_add_token(&sig.hash, .Pointer)
 		hash_add_token(&sig.hash, .Opaque)
 		return
 	}
 
 	if reflect.is_union(base) || reflect.is_raw_union(base) {
-		sig.features += {.Has_Opaque}
+		if depth == 0 do sig.features += {.Is_Opaque}
 		hash_add_token(&sig.hash, .Opaque)
 		return
 	}
@@ -191,12 +231,14 @@ hardened_allocator_generate_signature :: proc($T: typeid, sig: ^Type_Signature, 
 	if reflect.is_array(base) ||
 	   reflect.is_enumerated_array(base) ||
 	   reflect.is_fixed_capacity_dynamic_array(base) {
+		if depth == 0 do sig.features += {.Is_Array}
+
 		hash_add_token(&sig.hash, .Array_Begin)
 		elem_type := reflect.typeid_elem(T)
 		elem_info := type_info_of(elem_type)
 		elem_base := reflect.type_info_base(elem_info)
 
-		switch var in elem_base {
+		#partial switch var in elem_base.variant {
 		case runtime.Type_Info_Array:
 			hash_add_int(&sig.hash, var.count)
 		case runtime.Type_Info_Enumerated_Array:
@@ -206,8 +248,8 @@ hardened_allocator_generate_signature :: proc($T: typeid, sig: ^Type_Signature, 
 		}
 
 		if reflect.is_byte(elem_base) {
+			if depth == 0 do sig.features += {.Is_Buffer}
 			hash_add_token(&sig.hash, .Buffer)
-			sig.features += {.Has_Buffer}
 		} else {
 			hardened_allocator_generate_signature(elem_type, sig, depth + 1)
 		}
@@ -217,6 +259,8 @@ hardened_allocator_generate_signature :: proc($T: typeid, sig: ^Type_Signature, 
 	}
 
 	if reflect.is_struct(base) {
+		if depth == 0 do sig.features += {.Is_Struct}
+
 		hash_add_token(&sig.hash, .Struct_Begin)
 		field_types := reflect.struct_field_types(T)
 
@@ -229,58 +273,153 @@ hardened_allocator_generate_signature :: proc($T: typeid, sig: ^Type_Signature, 
 	}
 
 	hash_add_token(&sig.hash, .Data)
+	if depth == 0 do sig.features += {.Is_Data}
+
 	return
+}
+
+@(require_results)
+hardened_allocator_alloc_zone :: proc(
+	zone: ^^Hardened_Allocator_Zone,
+	zone_index: int,
+	allocator: Allocator,
+) -> Allocator_Error {
+	raw, err := _request_memory(
+		size_of(Hardened_Allocator_Zone),
+		align_of(Hardened_Allocator_Zone),
+		allocator,
+	)
+	if err != nil {
+		return err
+	}
+	zone^ = cast(^Hardened_Allocator_Zone)raw_data(raw)
+
+	zone^.region_list = nil
+	zone^.region_mutex = {}
+
+	ferr: Allocator_Error
+	zone^.free_lists, ferr = hardened_allocator_alloc_slice(
+		^Hardened_Allocator_Free_Block,
+		SIZE_CLASS_COUNT,
+		allocator,
+	)
+	if ferr != nil {
+		return ferr
+	}
+
+	mferr: Allocator_Error
+	zone^.free_lists_mutex, mferr = hardened_allocator_alloc_slice(
+		sync.Mutex,
+		SIZE_CLASS_COUNT,
+		allocator,
+	)
+	if mferr != nil {
+		return mferr
+	}
+
+	return nil
+}
+
+@(require_results)
+hardened_allocator_init_zones :: proc(s: ^Hardened_Allocator) -> Allocator_Error {
+	zerr: Allocator_Error
+	s.metadata.zones, zerr = hardened_allocator_alloc_slice(
+		^Hardened_Allocator_Zone,
+		s.metadata.type_bucket_count,
+		s.fallback_allocator,
+	)
+	if zerr != nil {
+		return zerr
+	}
+
+	for &zone, index in s.metadata.zones {
+		zaerr := hardened_allocator_alloc_zone(&zone, index, s.fallback_allocator)
+		if zaerr != nil {
+			return zaerr
+		}
+
+	}
+
+	return nil
+}
+
+@(require_results)
+hardened_allocator_init_metadata :: proc(
+	s: ^Hardened_Allocator,
+	type_bucket_count: int,
+	type_policy: Type_Class_Policy,
+	allocator: Allocator,
+) -> Allocator_Error {
+	s.fallback_allocator = allocator
+	raw, err := _request_memory(
+		size_of(Hardened_Allocator_Metadata),
+		align_of(Hardened_Allocator_Metadata),
+		allocator,
+	)
+	if err != nil {
+		return err
+	}
+
+	s.metadata = cast(^Hardened_Allocator_Metadata)raw_data(raw)
+
+	s.metadata.type_class_policy = type_policy
+
+	switch type_policy {
+	case .Randomized_Type_Signature:
+		seed_bytes: [8]u8
+		crypto.rand_bytes(seed_bytes[:])
+		s.metadata.type_class_seed = transmute(u64)seed_bytes
+		fallthrough
+
+	case .Type_Signature:
+		s.metadata.type_bucket_count = type_bucket_count
+
+	case .Manual_Registry:
+		s.metadata.type_bucket_count = len(Type_Class)
+	}
+
+	zerr := hardened_allocator_init_zones(s)
+	if zerr != nil {
+		return zerr
+	}
+
+	return nil
 }
 
 hardened_allocator_init :: proc(
 	s: ^Hardened_Allocator,
 	fallback_allocator := context.allocator,
+	type_bucket_count := TYPE_BUCKET_COUNT,
 	type_policy := Type_Class_Policy.Type_Signature,
 	loc := #caller_location,
-) {
-	s.fallback_allocator = fallback_allocator
-	s.regions = nil
-	s.region_mutex = {}
-	s.type_class_policy = type_policy
-
-	ferr: Allocator_Error
-	s.free_lists, ferr = hardened_allocator_alloc_slice(
-		^Hardened_Allocator_Free_Block,
-		SIZE_CLASS_COUNT,
-		fallback_allocator,
-	)
-	if ferr != nil {
-		panic("Failed to initilize allocator")
+) -> Allocator_Error {
+	if type_bucket_count < 1 {
+		return .Invalid_Argument
 	}
 
-	mferr: Allocator_Error
-	s.free_lists_mutex, mferr = hardened_allocator_alloc_slice(
-		sync.Mutex,
-		SIZE_CLASS_COUNT,
-		fallback_allocator,
-	)
-	if mferr != nil {
-		panic("Failed to initilize allocator")
-	}
+	return hardened_allocator_init_metadata(s, type_bucket_count, type_policy, fallback_allocator)
 }
 
 @(require_results)
 hardened_allocator_alloc :: proc(
 	s: ^Hardened_Allocator,
-	size: int,
+	$T: typeid,
 	alignment := DEFAULT_ALIGNMENT,
 	loc := #caller_location,
 ) -> (
 	rawptr,
 	Allocator_Error,
 ) {
-	bytes, err := hardened_allocator_alloc_bytes(s, size, alignment, loc)
+	sig := hardened_allocator_determine_type_signature(s, T)
+	bytes, err := hardened_allocator_alloc_bytes(s, &sig, size_of(T), alignment, loc)
+
 	return raw_data(bytes), err
 }
 
 @(require_results)
 hardened_allocator_alloc_bytes :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	size: int,
 	alignment := DEFAULT_ALIGNMENT,
 	loc := #caller_location,
@@ -288,7 +427,7 @@ hardened_allocator_alloc_bytes :: proc(
 	[]byte,
 	Allocator_Error,
 ) {
-	bytes, err := hardened_allocator_alloc_bytes_non_zeroed(s, size, alignment, loc)
+	bytes, err := hardened_allocator_alloc_bytes_non_zeroed(s, sig, size, alignment, loc)
 	if bytes != nil {
 		mem.zero_slice(bytes)
 	}
@@ -298,6 +437,7 @@ hardened_allocator_alloc_bytes :: proc(
 @(require_results)
 hardened_allocator_alloc_non_zeroed :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	size: int,
 	alignment := DEFAULT_ALIGNMENT,
 	loc := #caller_location,
@@ -305,33 +445,49 @@ hardened_allocator_alloc_non_zeroed :: proc(
 	rawptr,
 	Allocator_Error,
 ) {
-	bytes, err := hardened_allocator_alloc_bytes_non_zeroed(s, size, alignment, loc)
+	bytes, err := hardened_allocator_alloc_bytes_non_zeroed(s, sig, size, alignment, loc)
 	return raw_data(bytes), err
 }
 
 hardened_allocator_destroy :: proc(s: ^Hardened_Allocator, loc := #caller_location) {
-	region := s.regions
-	for region != nil {
-		next := region.next
+	for &zone in s.metadata.zones {
+		region := zone.region_list
+		for region != nil {
+			next := region.next
 
-		_free_memory(region.memory, s.fallback_allocator)
-		region = next
+			_free_memory(region.memory, s.fallback_allocator)
+			region = next
+		}
+
+		zone.region_list = nil
+		zone.region_mutex = {}
+		hardened_allocator_free_slice(
+			^Hardened_Allocator_Free_Block,
+			zone.free_lists,
+			s.fallback_allocator,
+		)
+		hardened_allocator_free_slice(sync.Mutex, zone.free_lists_mutex, s.fallback_allocator)
+
+		_free_memory(
+			slice.bytes_from_ptr(zone, size_of(Hardened_Allocator_Zone)),
+			s.fallback_allocator,
+		)
 	}
 
-	s.regions = nil
-	s.region_mutex = {}
-	hardened_allocator_free_slice(
-		^Hardened_Allocator_Free_Block,
-		s.free_lists,
+	hardened_allocator_free_slice(^Hardened_Allocator_Zone, s.metadata.zones, s.fallback_allocator)
+
+	_free_memory(
+		slice.bytes_from_ptr(s.metadata, size_of(Hardened_Allocator_Metadata)),
 		s.fallback_allocator,
 	)
-	hardened_allocator_free_slice(sync.Mutex, s.free_lists_mutex, s.fallback_allocator)
+
 	s.fallback_allocator = {}
 }
 
 @(require_results, no_sanitize_address)
 hardened_allocator_alloc_bytes_non_zeroed :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	size: int,
 	alignment := DEFAULT_ALIGNMENT,
 	loc := #caller_location,
@@ -346,19 +502,21 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 		return nil, .Invalid_Argument
 	}
 
-	block, prev, class_index, used_size, padding, lock := hardened_allocator_find_block(
+	block, prev, size_index, used_size, padding, lock := hardened_allocator_find_block(
 		s,
+		sig,
 		size,
 		alignment,
 	)
 	if block == nil {
-		err := hardened_allocator_add_region_for_request(s, size, alignment, loc)
+		err := hardened_allocator_add_region_for_request(s, sig, size, alignment, loc)
 		if err != nil {
 			return nil, err
 		}
 
-		block, prev, class_index, used_size, padding, lock = hardened_allocator_find_block(
+		block, prev, size_index, used_size, padding, lock = hardened_allocator_find_block(
 			s,
+			sig,
 			size,
 			alignment,
 		)
@@ -367,7 +525,9 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 		}
 	}
 
-	hardened_allocator_remove_free_block(s, class_index, prev, block)
+	zone := s.metadata.zones[sig.index]
+
+	hardened_allocator_remove_free_block(s, zone, size_index, prev, block)
 	sync.unlock(lock)
 
 	region := block.region
@@ -384,7 +544,7 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 		tail.region = region
 		tail.next = nil
 
-		hardened_allocator_insert_free_block(s, tail)
+		hardened_allocator_insert_free_block(s, sig, tail)
 	} else {
 		used_size = block.size
 	}
@@ -401,6 +561,9 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 	header.alignment = alignment
 	header.padding = padding
 	header.region = region
+	header.sig.features = sig.features
+	header.sig.hash = sig.hash
+	header.sig.index = sig.index
 
 	return mem.byte_slice(rawptr(user_addr), size), nil
 }
@@ -419,6 +582,7 @@ hardened_allocator_free :: proc(
 	header_addr := user_addr - uintptr(size_of(Hardened_Allocator_Allocation_Header))
 	header := (^Hardened_Allocator_Allocation_Header)(rawptr(header_addr))
 	region := header.region
+	zone := region.zone
 
 	if region == nil {
 		return .Invalid_Pointer
@@ -451,85 +615,10 @@ hardened_allocator_free :: proc(
 	block.region = region
 	block.next = nil
 
-	block = hardened_allocator_coalesce(s, block)
-	hardened_allocator_insert_free_block(s, block)
+	block = hardened_allocator_coalesce(s, zone, block)
+	hardened_allocator_insert_free_block(s, &header.sig, block)
 
 	return nil
-}
-
-@(require_results)
-hardened_allocator_resize :: proc(
-	s: ^Hardened_Allocator,
-	old_memory: rawptr,
-	old_size: int,
-	size: int,
-	alignment := DEFAULT_ALIGNMENT,
-	loc := #caller_location,
-) -> (
-	rawptr,
-	Allocator_Error,
-) {
-	bytes, err := hardened_allocator_resize_bytes(
-		s,
-		mem.byte_slice(old_memory, old_size),
-		size,
-		alignment,
-	)
-	return raw_data(bytes), err
-}
-
-@(require_results)
-hardened_allocator_resize_bytes :: proc(
-	s: ^Hardened_Allocator,
-	old_data: []byte,
-	size: int,
-	alignment := DEFAULT_ALIGNMENT,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	Allocator_Error,
-) {
-	return mem.default_resize_bytes_align(old_data, size, alignment, hardened_allocator(s))
-}
-
-@(require_results)
-hardened_allocator_resize_non_zeroed :: proc(
-	s: ^Hardened_Allocator,
-	old_memory: rawptr,
-	old_size: int,
-	size: int,
-	alignment := DEFAULT_ALIGNMENT,
-	loc := #caller_location,
-) -> (
-	rawptr,
-	Allocator_Error,
-) {
-	bytes, err := hardened_allocator_resize_bytes_non_zeroed(
-		s,
-		mem.byte_slice(old_memory, old_size),
-		size,
-		alignment,
-	)
-	return raw_data(bytes), err
-}
-
-@(require_results)
-hardened_allocator_resize_bytes_non_zeroed :: proc(
-	s: ^Hardened_Allocator,
-	old_data: []byte,
-	size: int,
-	alignment := DEFAULT_ALIGNMENT,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	Allocator_Error,
-) {
-	return mem.default_resize_bytes_align_non_zeroed(
-		old_data,
-		size,
-		alignment,
-		hardened_allocator(s),
-	)
 }
 
 hardened_allocator_proc :: proc(
@@ -546,11 +635,8 @@ hardened_allocator_proc :: proc(
 	s := (^Hardened_Allocator)(allocator_data)
 
 	switch mode {
-	case .Alloc:
-		return hardened_allocator_alloc_bytes(s, size, alignment, loc)
-
-	case .Alloc_Non_Zeroed:
-		return hardened_allocator_alloc_bytes_non_zeroed(s, size, alignment, loc)
+	case .Alloc, .Alloc_Non_Zeroed:
+		return nil, .Mode_Not_Implemented
 
 	case .Free:
 		return nil, hardened_allocator_free(s, old_memory, loc)
@@ -558,21 +644,8 @@ hardened_allocator_proc :: proc(
 	case .Free_All:
 		return nil, .Mode_Not_Implemented
 
-	case .Resize:
-		return hardened_allocator_resize_bytes(
-			s,
-			mem.byte_slice(old_memory, old_size),
-			size,
-			alignment,
-		)
-
-	case .Resize_Non_Zeroed:
-		return hardened_allocator_resize_bytes_non_zeroed(
-			s,
-			mem.byte_slice(old_memory, old_size),
-			size,
-			alignment,
-		)
+	case .Resize, .Resize_Non_Zeroed:
+		return nil, .Mode_Not_Implemented
 
 	case .Query_Features:
 		set := (^Allocator_Mode_Set)(old_memory)
@@ -611,11 +684,13 @@ hardened_allocator_proc :: proc(
 
 hardened_allocator_add_region_for_request :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	size: int,
 	alignment: int,
 	loc := #caller_location,
 ) -> Allocator_Error {
-	sync.mutex_guard(&s.region_mutex)
+	zone := s.metadata.zones[sig.index]
+	sync.mutex_guard(&zone.region_mutex)
 
 	minimum_allocation_size := size + size_of(Hardened_Allocator_Allocation_Header)
 	if alignment > 1 {
@@ -659,13 +734,15 @@ hardened_allocator_add_region_for_request :: proc(
 	region := (^Hardened_Allocator_Region)(rawptr(usable_start))
 
 	region^ = Hardened_Allocator_Region {
-		next         = s.regions,
+		next         = zone.region_list,
+		zone         = zone,
 		memory       = raw_region_memory,
+		type_index   = sig.index,
 		usable_start = rawptr(usable_start),
 		usable_size  = usable_size,
 	}
 
-	s.regions = region
+	zone.region_list = region
 
 	block_addr := usable_start + uintptr(region_header_size)
 	block_size := usable_size - region_header_size
@@ -675,7 +752,7 @@ hardened_allocator_add_region_for_request :: proc(
 	block.region = region
 	block.next = nil
 
-	hardened_allocator_insert_free_block(s, block)
+	hardened_allocator_insert_free_block(s, sig, block)
 
 	return nil
 }
@@ -683,12 +760,13 @@ hardened_allocator_add_region_for_request :: proc(
 @(require_results)
 hardened_allocator_find_block :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	size: int,
 	alignment: int,
 ) -> (
 	block: ^Hardened_Allocator_Free_Block,
 	prev: ^Hardened_Allocator_Free_Block,
-	class_index: int,
+	size_index: int,
 	used_size: int,
 	padding: int,
 	lock: ^sync.Mutex,
@@ -698,18 +776,20 @@ hardened_allocator_find_block :: proc(
 		minimum_possible += alignment - 1
 	}
 
-	start_class := hardened_allocator_class_index(minimum_possible)
+	initial_size_class := hardened_allocator_class_index(s, minimum_possible)
 
-	for class in start_class ..< SIZE_CLASS_COUNT {
-		lock = &s.free_lists_mutex[class]
+	zone := s.metadata.zones[sig.index]
+
+	for size_class_index in initial_size_class ..< SIZE_CLASS_COUNT {
+		lock = &zone.free_lists_mutex[size_class_index]
 		sync.lock(lock)
 
 		prev = nil
-		block = s.free_lists[class]
+		block = zone.free_lists[size_class_index]
 		for block != nil {
 			used_size, padding = hardened_allocator_required_block_size(block, size, alignment)
 			if used_size <= block.size {
-				class_index = class
+				size_index = size_class_index
 				return
 			}
 			prev = block
@@ -760,37 +840,40 @@ hardened_allocator_align_up :: proc(value, alignment: uintptr) -> uintptr {
 }
 
 @(require_results)
-hardened_allocator_class_index :: proc(size: int) -> int {
+hardened_allocator_class_index :: proc(s: ^Hardened_Allocator, size: int) -> int {
 	threshold := MIN_SIZE_CLASS
-	index := 0
+	size_idx := 0
 
-	for index < SIZE_CLASS_COUNT - 1 && size > threshold {
+	for size_idx < SIZE_CLASS_COUNT - 1 && size > threshold {
 		threshold <<= 1
-		index += 1
+		size_idx += 1
 	}
 
-	return index
+	return size_idx
 }
 
 hardened_allocator_insert_free_block :: proc(
 	s: ^Hardened_Allocator,
+	sig: ^Type_Signature,
 	block: ^Hardened_Allocator_Free_Block,
 ) {
-	class_index := hardened_allocator_class_index(block.size)
-	sync.mutex_guard(&s.free_lists_mutex[class_index])
-	block.next = s.free_lists[class_index]
-	s.free_lists[class_index] = block
+	size_index := hardened_allocator_class_index(s, block.size)
+	zone := s.metadata.zones[sig.index]
+	sync.mutex_guard(&zone.free_lists_mutex[size_index])
+	block.next = zone.free_lists[size_index]
+	zone.free_lists[size_index] = block
 }
 
-// the caller should handle locking the free list
+// The caller should handle locking the free list
 hardened_allocator_remove_free_block :: proc(
 	s: ^Hardened_Allocator,
-	class_index: int,
+	zone: ^Hardened_Allocator_Zone,
+	index: int,
 	prev: ^Hardened_Allocator_Free_Block,
 	block: ^Hardened_Allocator_Free_Block,
 ) {
 	if prev == nil {
-		s.free_lists[class_index] = block.next
+		zone.free_lists[index] = block.next
 	} else {
 		prev.next = block.next
 	}
@@ -800,13 +883,14 @@ hardened_allocator_remove_free_block :: proc(
 @(require_results)
 hardened_allocator_coalesce :: proc(
 	s: ^Hardened_Allocator,
+	zone: ^Hardened_Allocator_Zone,
 	block: ^Hardened_Allocator_Free_Block,
 ) -> ^Hardened_Allocator_Free_Block {
-	for class_index in 0 ..< SIZE_CLASS_COUNT {
-		sync.mutex_guard(&s.free_lists_mutex[class_index])
+	for size_index in 0 ..< SIZE_CLASS_COUNT {
+		sync.mutex_guard(&zone.free_lists_mutex[size_index])
 
 		prev: ^Hardened_Allocator_Free_Block = nil
-		other := s.free_lists[class_index]
+		other := zone.free_lists[size_index]
 
 		for other != nil {
 			if other.region != block.region {
@@ -821,13 +905,13 @@ hardened_allocator_coalesce :: proc(
 			other_end := other_start + uintptr(other.size)
 
 			if other_end == block_start {
-				hardened_allocator_remove_free_block(s, class_index, prev, other)
+				hardened_allocator_remove_free_block(s, zone, size_index, prev, other)
 				other.size += block.size
 				return other
 			}
 
 			if block_end == other_start {
-				hardened_allocator_remove_free_block(s, class_index, prev, other)
+				hardened_allocator_remove_free_block(s, zone, size_index, prev, other)
 				block.size += other.size
 				return block
 			}

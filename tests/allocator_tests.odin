@@ -2,18 +2,21 @@ package allocator_tests
 
 import "../hardened_alloc"
 import "base:runtime"
+import "core:log"
 import "core:mem"
 import "core:testing"
 import "core:thread"
-import "core:log"
 
 // Tests were generated with the help of ChatGPT
-// https://chatgpt.com/s/t_6a040a670be88191b68fd3ff53e8210f
+// https://chatgpt.com/s/t_6a095861df908191839e3f875287e916
 
 //
 // Small deterministic RNG for randomized stress tests.
 // Seed it with t.seed so failing runs are reproducible.
 //
+
+TEST_BLOCK_SIZE :: 4096
+
 next_u64 :: proc(state: ^u64) -> u64 {
 	state^ = state^ * 6364136223846793005 + 1442695040888963407
 	return state^
@@ -48,28 +51,30 @@ expect_alloc_ok :: proc(t: ^testing.T, buf: []u8, err: mem.Allocator_Error, msg:
 // 1. Basic allocation/free behavior
 //
 test_allocator_basic :: proc(t: ^testing.T, allocator: mem.Allocator) {
-	buf, err := mem.alloc_bytes(128, mem.DEFAULT_ALIGNMENT, allocator)
-	if !expect_alloc_ok(t, buf, err, "basic allocation failed") {
+	arr, err := hardened_alloc.typed_new([128]u8, allocator = allocator)
+	if err != .None || arr == nil {
+		testing.expect(t, false, "basic allocation failed")
 		return
 	}
+	defer free(rawptr(arr), allocator)
 
+	buf := arr^[:]
 	testing.expect_value(t, len(buf), 128)
-
-	free_err := mem.free_bytes(buf, allocator)
-	testing.expect_value(t, free_err, mem.Allocator_Error.None)
 }
 
 //
-// 2. Zero-initialization behavior for normal alloc_bytes
+// 2. Zero-initialization behavior
 //
 test_allocator_zeroed_alloc :: proc(t: ^testing.T, allocator: mem.Allocator) {
-	buf, err := mem.alloc_bytes(256, mem.DEFAULT_ALIGNMENT, allocator)
-	if !expect_alloc_ok(t, buf, err, "zeroed allocation failed") {
+	arr, err := hardened_alloc.typed_new([256]u8, allocator = allocator)
+	if err != .None || arr == nil {
+		testing.expect(t, false, "zeroed allocation failed")
 		return
 	}
-	defer mem.free_bytes(buf, allocator)
+	defer free(rawptr(arr), allocator)
 
-	testing.expect(t, mem.check_zero(buf), "alloc_bytes was expected to return zeroed memory")
+	buf := arr^[:]
+	testing.expect(t, mem.check_zero(buf), "allocation was expected to return zeroed memory")
 }
 
 //
@@ -79,12 +84,13 @@ test_allocator_alignment :: proc(t: ^testing.T, allocator: mem.Allocator) {
 	alignments := [?]int{1, 2, 4, 8, 16, 32, 64, 128}
 
 	for alignment in alignments {
-		buf, err := mem.alloc_bytes(257, alignment, allocator)
-		if !expect_alloc_ok(t, buf, err, "aligned allocation failed") {
+		arr, err := hardened_alloc.typed_new([257]u8, alignment, allocator)
+		if err != .None || arr == nil {
+			testing.expectf(t, false, "aligned allocation failed for alignment %d", alignment)
 			continue
 		}
 
-		ptr := rawptr(raw_data(buf))
+		ptr := rawptr(arr)
 		testing.expectf(
 			t,
 			mem.is_aligned(ptr, alignment),
@@ -92,7 +98,7 @@ test_allocator_alignment :: proc(t: ^testing.T, allocator: mem.Allocator) {
 			alignment,
 		)
 
-		free_err := mem.free_bytes(buf, allocator)
+		free_err := free(rawptr(arr), allocator)
 		testing.expect_value(t, free_err, mem.Allocator_Error.None)
 	}
 }
@@ -101,12 +107,14 @@ test_allocator_alignment :: proc(t: ^testing.T, allocator: mem.Allocator) {
 // 4. Pattern-fill correctness
 //
 test_allocator_pattern_fill :: proc(t: ^testing.T, allocator: mem.Allocator) {
-	buf, err := mem.alloc_bytes(1024, 16, allocator)
-	if !expect_alloc_ok(t, buf, err, "pattern allocation failed") {
+	arr, err := hardened_alloc.typed_new([1024]u8, allocator = allocator)
+	if err != .None || arr == nil {
+		testing.expect(t, false, "pattern allocation failed")
 		return
 	}
-	defer mem.free_bytes(buf, allocator)
+	defer free(rawptr(arr), allocator)
 
+	buf := arr^[:]
 	fill_pattern(buf, 0xA5)
 	testing.expect(t, check_pattern(buf, 0xA5), "pattern verification failed")
 }
@@ -162,69 +170,212 @@ test_allocator_resize_shrink :: proc(t: ^testing.T, allocator: mem.Allocator) {
 //
 // 7. Randomized allocate/free/pattern stress test
 //
+//
+// Stress-test allocation types
+//
+
+Stress_Kind :: enum {
+	Data_Block,
+	Pointer_Block,
+	Procedure_Block,
+	Mixed_Block,
+}
+
+STRESS_KIND_COUNT :: 4
+
+Stress_Data_Block :: struct {
+	marker: u64,
+	data:   [TEST_BLOCK_SIZE]u8,
+}
+
+Stress_Pointer_Block :: struct {
+	marker: u64,
+	next:   ^Stress_Pointer_Block,
+	data:   [TEST_BLOCK_SIZE]u8,
+}
+
+Stress_Procedure_Block :: struct {
+	marker:   u64,
+	callback: proc(),
+	data:     [TEST_BLOCK_SIZE]u8,
+}
+
+Stress_Mixed_Block :: struct {
+	marker: u64,
+	next:   ^Stress_Mixed_Block,
+	count:  int,
+	data:   [TEST_BLOCK_SIZE]u8,
+}
+
 Stress_Slot :: struct {
-	data:      []u8,
+	ptr:       rawptr,
+	kind:      Stress_Kind,
 	seed:      u8,
 	live:      bool,
 	alignment: int,
 }
 
-test_allocator_randomized_stress :: proc(t: ^testing.T, allocator: mem.Allocator) {
+stress_alloc_typed :: proc(
+	kind: Stress_Kind,
+	alignment: int,
+	allocator: mem.Allocator,
+) -> (rawptr, mem.Allocator_Error) {
+	switch kind {
+	case .Data_Block:
+		p, err := hardened_alloc.typed_new(Stress_Data_Block, alignment, allocator)
+		return rawptr(p), err
+
+	case .Pointer_Block:
+		p, err := hardened_alloc.typed_new(Stress_Pointer_Block, alignment, allocator)
+		return rawptr(p), err
+
+	case .Procedure_Block:
+		p, err := hardened_alloc.typed_new(Stress_Procedure_Block, alignment, allocator)
+		return rawptr(p), err
+
+	case .Mixed_Block:
+		p, err := hardened_alloc.typed_new(Stress_Mixed_Block, alignment, allocator)
+		return rawptr(p), err
+	}
+
+	return nil, .Invalid_Argument
+}
+
+stress_init_allocation :: proc(
+	ptr: rawptr,
+	kind: Stress_Kind,
+	seed: u8,
+) {
+	switch kind {
+	case .Data_Block:
+		block := cast(^Stress_Data_Block)ptr
+		block.marker = 0xDADA_DADA_DADA_DADA
+		fill_pattern(block.data[:], seed)
+
+	case .Pointer_Block:
+		block := cast(^Stress_Pointer_Block)ptr
+		block.marker = 0xBEEF_BEEF_BEEF_BEEF
+		block.next = nil
+		fill_pattern(block.data[:], seed)
+
+	case .Procedure_Block:
+		block := cast(^Stress_Procedure_Block)ptr
+		block.marker = 0xABCD_ABCD_ABCD_ABCD
+		block.callback = nil
+		fill_pattern(block.data[:], seed)
+
+	case .Mixed_Block:
+		block := cast(^Stress_Mixed_Block)ptr
+		block.marker = 0xFACE_FACE_FACE_FACE
+		block.next = nil
+		block.count = 0x1234_5678
+		fill_pattern(block.data[:], seed)
+	}
+}
+
+stress_check_allocation :: proc(
+	ptr: rawptr,
+	kind: Stress_Kind,
+	seed: u8,
+) -> bool {
+	switch kind {
+	case .Data_Block:
+		block := cast(^Stress_Data_Block)ptr
+		return block.marker == 0xDADA_DADA_DADA_DADA &&
+		       check_pattern(block.data[:], seed)
+
+	case .Pointer_Block:
+		block := cast(^Stress_Pointer_Block)ptr
+		return block.marker == 0xBEEF_BEEF_BEEF_BEEF &&
+		       block.next == nil &&
+		       check_pattern(block.data[:], seed)
+
+	case .Procedure_Block:
+		block := cast(^Stress_Procedure_Block)ptr
+		return block.marker == 0xABCD_ABCD_ABCD_ABCD &&
+		       block.callback == nil &&
+		       check_pattern(block.data[:], seed)
+
+	case .Mixed_Block:
+		block := cast(^Stress_Mixed_Block)ptr
+		return block.marker == 0xFACE_FACE_FACE_FACE &&
+		       block.next == nil &&
+		       block.count == 0x1234_5678 &&
+		       check_pattern(block.data[:], seed)
+	}
+
+	return false
+}
+
+test_allocator_randomized_stress :: proc(
+	t: ^testing.T,
+	allocator: mem.Allocator,
+) {
 	SLOT_COUNT :: 512
-	OPS :: 5000
+	OPS        :: 5000
 
 	slots := [SLOT_COUNT]Stress_Slot{}
 	rng := t.seed
+
+	alignments := [?]int{1, 2, 4, 8, 16, 32, 64}
 
 	for op := 0; op < OPS; op += 1 {
 		index := rand_range(&rng, SLOT_COUNT)
 		slot := &slots[index]
 
 		if !slot.live {
-			size := 1 + rand_range(&rng, 2048)
-			alignments := [?]int{1, 2, 4, 8, 16, 32, 64}
+			kind := Stress_Kind(rand_range(&rng, STRESS_KIND_COUNT))
 			alignment := alignments[rand_range(&rng, len(alignments))]
 
-			buf, err := mem.alloc_bytes(size, alignment, allocator)
-			if err != .None || len(buf) != size {
+			ptr, err := stress_alloc_typed(kind, alignment, allocator)
+			if err != .None || ptr == nil {
 				testing.expectf(
 					t,
 					false,
-					"stress alloc failed at op %d, size=%d, alignment=%d",
+					"stress alloc failed at op %d, kind=%v, alignment=%d",
 					op,
-					size,
+					kind,
 					alignment,
 				)
 				continue
 			}
 
-			ptr := rawptr(raw_data(buf))
 			testing.expectf(
 				t,
 				mem.is_aligned(ptr, alignment),
-				"stress allocation alignment failed at op %d",
+				"stress allocation alignment failed at op %d, kind=%v, alignment=%d",
 				op,
+				kind,
+				alignment,
 			)
 
 			seed := u8(rand_range(&rng, 256))
-			fill_pattern(buf, seed)
+			stress_init_allocation(ptr, kind, seed)
 
-			slot.data = buf
+			slot.ptr = ptr
+			slot.kind = kind
 			slot.seed = seed
 			slot.live = true
 			slot.alignment = alignment
 		} else {
 			testing.expectf(
 				t,
-				check_pattern(slot.data, slot.seed),
-				"stress pattern corruption detected at op %d",
+				stress_check_allocation(slot.ptr, slot.kind, slot.seed),
+				"stress allocation corrupted at op %d, kind=%v",
 				op,
+				slot.kind,
 			)
 
-			free_err := mem.free_bytes(slot.data, allocator)
-			testing.expectf(t, free_err == .None, "stress free failed at op %d", op)
+			free_err := free(slot.ptr, allocator)
+			testing.expectf(
+				t,
+				free_err == .None,
+				"stress free failed at op %d, kind=%v",
+				op,
+				slot.kind,
+			)
 
-			slot.data = nil
+			slot.ptr = nil
 			slot.live = false
 		}
 	}
@@ -232,13 +383,14 @@ test_allocator_randomized_stress :: proc(t: ^testing.T, allocator: mem.Allocator
 	// Cleanup remaining live allocations.
 	for &slot in slots {
 		if slot.live {
-			testing.expect(
+			testing.expectf(
 				t,
-				check_pattern(slot.data, slot.seed),
-				"final cleanup detected corrupted pattern",
+				stress_check_allocation(slot.ptr, slot.kind, slot.seed),
+				"final cleanup detected corrupted allocation, kind=%v",
+				slot.kind,
 			)
 
-			free_err := mem.free_bytes(slot.data, allocator)
+			free_err := free(slot.ptr, allocator)
 			testing.expect_value(t, free_err, mem.Allocator_Error.None)
 		}
 	}
@@ -303,6 +455,17 @@ Thread_Stress_Args :: struct {
 	result:       ^Thread_Stress_Result,
 }
 
+/*
+1  Allocation failed unexpectedly
+2  Alignment violation
+3  Live allocation validation failed
+4  Free failed
+5  Replacement free failed
+6  Replacement allocation failed
+7  Replacement alignment violation
+8  Final live allocation validation failed
+9  Final cleanup free failed
+*/
 thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 	SLOT_COUNT :: 64
 
@@ -312,6 +475,8 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 	args.result.ok = true
 	args.result.failed_op = -1
 	args.result.failure_code = 0
+
+	alignments := [?]int{1, 2, 4, 8, 16, 32, 64}
 
 	for op := 0; op < THREAD_OPS; op += 1 {
 		index := rand_range(&rng, SLOT_COUNT)
@@ -323,36 +488,35 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 		}
 
 		if !slot.live {
-			size := 1 + rand_range(&rng, 4096)
-			alignments := [?]int{1, 2, 4, 8, 16, 32, 64}
+			kind := Stress_Kind(rand_range(&rng, STRESS_KIND_COUNT))
 			alignment := alignments[rand_range(&rng, len(alignments))]
 
-			buf, err := mem.alloc_bytes(size, alignment, args.allocator)
-			if err != .None || len(buf) != size {
+			ptr, err := stress_alloc_typed(kind, alignment, args.allocator)
+			if err != .None || ptr == nil {
 				args.result.ok = false
 				args.result.failed_op = op
 				args.result.failure_code = 1
 				return
 			}
 
-			ptr := rawptr(raw_data(buf))
 			if !mem.is_aligned(ptr, alignment) {
 				args.result.ok = false
 				args.result.failed_op = op
 				args.result.failure_code = 2
-				_ = mem.free_bytes(buf, args.allocator)
+				_ = free(ptr, args.allocator)
 				return
 			}
 
 			seed := u8(rand_range(&rng, 256))
-			fill_pattern(buf, seed)
+			stress_init_allocation(ptr, kind, seed)
 
-			slot.data = buf
+			slot.ptr = ptr
+			slot.kind = kind
 			slot.seed = seed
 			slot.live = true
 			slot.alignment = alignment
 		} else {
-			if !check_pattern(slot.data, slot.seed) {
+			if !stress_check_allocation(slot.ptr, slot.kind, slot.seed) {
 				args.result.ok = false
 				args.result.failed_op = op
 				args.result.failure_code = 3
@@ -363,7 +527,7 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 
 			switch action {
 			case 0:
-				free_err := mem.free_bytes(slot.data, args.allocator)
+				free_err := free(slot.ptr, args.allocator)
 				if free_err != .None {
 					args.result.ok = false
 					args.result.failed_op = op
@@ -371,38 +535,55 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 					return
 				}
 
-				slot.data = nil
+				slot.ptr = nil
 				slot.live = false
 
 			case 1, 2:
-				old_len := len(slot.data)
-				new_len := 1 + rand_range(&rng, 4096)
-
-				resized, resize_err := mem.resize_bytes(
-					slot.data,
-					new_len,
-					slot.alignment,
-					args.allocator,
-				)
-
-				if resize_err != .None || len(resized) != new_len {
+				// Type churn:
+				// free an existing live allocation, then allocate a possibly
+				// different kind of type in its place.
+				free_err := free(slot.ptr, args.allocator)
+				if free_err != .None {
 					args.result.ok = false
 					args.result.failed_op = op
 					args.result.failure_code = 5
 					return
 				}
 
-				preserved := min(old_len, new_len)
-				if !check_pattern(resized[:preserved], slot.seed) {
+				slot.ptr = nil
+				slot.live = false
+
+				new_kind := Stress_Kind(rand_range(&rng, STRESS_KIND_COUNT))
+				new_alignment := alignments[rand_range(&rng, len(alignments))]
+
+				new_ptr, alloc_err := stress_alloc_typed(
+					new_kind,
+					new_alignment,
+					args.allocator,
+				)
+				if alloc_err != .None || new_ptr == nil {
 					args.result.ok = false
 					args.result.failed_op = op
 					args.result.failure_code = 6
 					return
 				}
 
-				slot.data = resized
-				slot.seed = u8(rand_range(&rng, 256))
-				fill_pattern(slot.data, slot.seed)
+				if !mem.is_aligned(new_ptr, new_alignment) {
+					args.result.ok = false
+					args.result.failed_op = op
+					args.result.failure_code = 7
+					_ = free(new_ptr, args.allocator)
+					return
+				}
+
+				new_seed := u8(rand_range(&rng, 256))
+				stress_init_allocation(new_ptr, new_kind, new_seed)
+
+				slot.ptr = new_ptr
+				slot.kind = new_kind
+				slot.seed = new_seed
+				slot.live = true
+				slot.alignment = new_alignment
 			}
 		}
 	}
@@ -410,18 +591,18 @@ thread_allocator_stress_worker :: proc(args: Thread_Stress_Args) {
 	// Final validation and cleanup.
 	for &slot in slots {
 		if slot.live {
-			if !check_pattern(slot.data, slot.seed) {
-				args.result.ok = false
-				args.result.failed_op = THREAD_OPS
-				args.result.failure_code = 7
-				return
-			}
-
-			free_err := mem.free_bytes(slot.data, args.allocator)
-			if free_err != .None {
+			if !stress_check_allocation(slot.ptr, slot.kind, slot.seed) {
 				args.result.ok = false
 				args.result.failed_op = THREAD_OPS
 				args.result.failure_code = 8
+				return
+			}
+
+			free_err := free(slot.ptr, args.allocator)
+			if free_err != .None {
+				args.result.ok = false
+				args.result.failed_op = THREAD_OPS
+				args.result.failure_code = 9
 				return
 			}
 		}
@@ -469,7 +650,7 @@ test_allocator_thread_safety_stress :: proc(t: ^testing.T, allocator: mem.Alloca
 //
 
 @(test)
-default_allocator_basic :: proc(t: ^testing.T) {
+baseline_allocator_basic :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -479,7 +660,7 @@ default_allocator_basic :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_zeroed_alloc :: proc(t: ^testing.T) {
+baseline_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -489,7 +670,7 @@ default_allocator_zeroed_alloc :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_alignment :: proc(t: ^testing.T) {
+baseline_allocator_alignment :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -499,7 +680,7 @@ default_allocator_alignment :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_pattern_fill :: proc(t: ^testing.T) {
+baseline_allocator_pattern_fill :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -509,7 +690,7 @@ default_allocator_pattern_fill :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_resize_grow :: proc(t: ^testing.T) {
+baseline_allocator_resize_grow :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -519,7 +700,7 @@ default_allocator_resize_grow :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_resize_shrink :: proc(t: ^testing.T) {
+baseline_allocator_resize_shrink :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -529,7 +710,7 @@ default_allocator_resize_shrink :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_randomized_stress :: proc(t: ^testing.T) {
+baseline_allocator_randomized_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -539,7 +720,7 @@ default_allocator_randomized_stress :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
+baseline_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
@@ -549,14 +730,58 @@ default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
 }
 
 @(test)
-default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
+baseline_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Segregated_Free_List
 	hardened_alloc.segregated_free_list_init(&all, context.allocator)
 	defer hardened_alloc.segregated_free_list_destroy(&all)
 	context.allocator = hardened_alloc.segregated_free_list_allocator(&all)
 
 	test_allocator_thread_safety_stress(t, context.allocator)
-	//test_allocator_thread_safety_stress(t, runtime.heap_allocator())
+}
+
+@(test)
+default_allocator_basic :: proc(t: ^testing.T) {
+	test_allocator_basic(t, context.allocator)
+}
+
+@(test)
+default_allocator_zeroed_alloc :: proc(t: ^testing.T) {
+	test_allocator_zeroed_alloc(t, context.allocator)
+}
+
+@(test)
+default_allocator_alignment :: proc(t: ^testing.T) {
+	test_allocator_alignment(t, context.allocator)
+}
+
+@(test)
+default_allocator_pattern_fill :: proc(t: ^testing.T) {
+	test_allocator_pattern_fill(t, context.allocator)
+}
+
+@(test)
+default_allocator_resize_grow :: proc(t: ^testing.T) {
+	test_allocator_resize_grow(t, context.allocator)
+}
+
+@(test)
+default_allocator_resize_shrink :: proc(t: ^testing.T) {
+	test_allocator_resize_shrink(t, context.allocator)
+}
+
+@(test)
+default_allocator_randomized_stress :: proc(t: ^testing.T) {
+	test_allocator_randomized_stress(t, context.allocator)
+}
+
+@(test)
+default_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
+	test_allocator_randomized_resize_stress(t, context.allocator)
+}
+
+@(test)
+default_allocator_thread_safety_stress :: proc(t: ^testing.T) {
+	test_allocator_thread_safety_stress(t, runtime.heap_allocator())
 }
 
 @(test)
@@ -600,26 +825,6 @@ hardened_allocator_pattern_fill :: proc(t: ^testing.T) {
 }
 
 @(test)
-hardened_allocator_resize_grow :: proc(t: ^testing.T) {
-	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
-	defer hardened_alloc.hardened_allocator_destroy(&all)
-	context.allocator = hardened_alloc.hardened_allocator(&all)
-
-	test_allocator_resize_grow(t, context.allocator)
-}
-
-@(test)
-hardened_allocator_resize_shrink :: proc(t: ^testing.T) {
-	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
-	defer hardened_alloc.hardened_allocator_destroy(&all)
-	context.allocator = hardened_alloc.hardened_allocator(&all)
-
-	test_allocator_resize_shrink(t, context.allocator)
-}
-
-@(test)
 hardened_allocator_randomized_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
 	hardened_alloc.hardened_allocator_init(&all, context.allocator)
@@ -630,22 +835,10 @@ hardened_allocator_randomized_stress :: proc(t: ^testing.T) {
 }
 
 @(test)
-hardened_allocator_randomized_resize_stress :: proc(t: ^testing.T) {
-	all: hardened_alloc.Hardened_Allocator
-	hardened_alloc.hardened_allocator_init(&all, context.allocator)
-	defer hardened_alloc.hardened_allocator_destroy(&all)
-	context.allocator = hardened_alloc.hardened_allocator(&all)
-
-	test_allocator_randomized_resize_stress(t, context.allocator)
-}
-
-@(test)
 hardened_allocator_thread_safety_stress :: proc(t: ^testing.T) {
 	all: hardened_alloc.Hardened_Allocator
 	hardened_alloc.hardened_allocator_init(&all, context.allocator)
 	defer hardened_alloc.hardened_allocator_destroy(&all)
-	context.allocator = hardened_alloc.hardened_allocator(&all)
 
-	test_allocator_thread_safety_stress(t, context.allocator)
-	//test_allocator_thread_safety_stress(t, runtime.heap_allocator())
+	test_allocator_thread_safety_stress(t, hardened_alloc.hardened_allocator(&all))
 }
