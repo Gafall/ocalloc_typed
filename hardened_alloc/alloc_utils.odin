@@ -11,12 +11,13 @@ Allocator_Query_Info :: runtime.Allocator_Query_Info
 
 
 DEFAULT_ALIGNMENT :: mem.DEFAULT_ALIGNMENT
-SIZE_CLASS_COUNT :: 32
+SIZE_CLASS_COUNT :: 16
 TYPE_BUCKET_COUNT :: 16
 MIN_SIZE_CLASS :: 32
 MIN_SPLIT_PAYLOAD :: 16
 DEFAULT_REGION_SIZE :: 64 * mem.DEFAULT_PAGE_SIZE
 MAX_RECURSION_DEPTH :: 16
+DEFAULT_QUARANTINE_SIZE :: 10
 
 manual_entry :: proc($T: typeid, class: Type_Class) -> Manual_Type_Entry {
 	return Manual_Type_Entry{id = typeid_of(T), class = class}

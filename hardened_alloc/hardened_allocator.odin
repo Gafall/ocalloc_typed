@@ -2,6 +2,7 @@ package hardened_alloc
 
 import "base:runtime"
 import "core:crypto"
+import "core:math/rand"
 import "core:mem"
 import "core:reflect"
 import "core:slice"
@@ -90,6 +91,9 @@ Hardened_Allocator_Zone :: struct {
 	region_mutex:     sync.Mutex,
 	free_lists:       []^Hardened_Allocator_Free_Block,
 	free_lists_mutex: []sync.Mutex,
+	quarantine:       []^Hardened_Allocator_Free_Block,
+	quarantine_count: int,
+	quarantine_mutex: sync.Mutex,
 }
 
 Hardened_Allocator :: struct {
@@ -102,6 +106,8 @@ Hardened_Allocator_Metadata :: struct {
 	type_class_policy:    Type_Class_Policy,
 	manual_type_registry: Manual_Type_Registry,
 	type_bucket_count:    int,
+	size_class_count:     int,
+	quarantine_size:      int,
 	type_class_seed:      u64,
 }
 
@@ -292,6 +298,7 @@ hardened_allocator_generate_signature :: proc(T: typeid, sig: ^Type_Signature, d
 
 @(require_results)
 hardened_allocator_alloc_zone :: proc(
+	s: ^Hardened_Allocator,
 	zone: ^^Hardened_Allocator_Zone,
 	zone_index: int,
 	allocator: Allocator,
@@ -312,7 +319,7 @@ hardened_allocator_alloc_zone :: proc(
 	ferr: Allocator_Error
 	zone^.free_lists, ferr = hardened_allocator_alloc_slice(
 		^Hardened_Allocator_Free_Block,
-		SIZE_CLASS_COUNT,
+		s.metadata.size_class_count,
 		allocator,
 	)
 	if ferr != nil {
@@ -322,12 +329,19 @@ hardened_allocator_alloc_zone :: proc(
 	mferr: Allocator_Error
 	zone^.free_lists_mutex, mferr = hardened_allocator_alloc_slice(
 		sync.Mutex,
-		SIZE_CLASS_COUNT,
+		s.metadata.size_class_count,
 		allocator,
 	)
 	if mferr != nil {
 		return mferr
 	}
+
+	qerr: Allocator_Error
+	zone^.quarantine, qerr = hardened_allocator_alloc_slice(
+		^Hardened_Allocator_Free_Block,
+		s.metadata.quarantine_size,
+		allocator,
+	)
 
 	return nil
 }
@@ -345,7 +359,7 @@ hardened_allocator_init_zones :: proc(s: ^Hardened_Allocator) -> Allocator_Error
 	}
 
 	for &zone, index in s.metadata.zones {
-		zaerr := hardened_allocator_alloc_zone(&zone, index, s.fallback_allocator)
+		zaerr := hardened_allocator_alloc_zone(s, &zone, index, s.fallback_allocator)
 		if zaerr != nil {
 			return zaerr
 		}
@@ -359,6 +373,8 @@ hardened_allocator_init_zones :: proc(s: ^Hardened_Allocator) -> Allocator_Error
 hardened_allocator_init_metadata :: proc(
 	s: ^Hardened_Allocator,
 	type_bucket_count: int,
+	size_class_count: int,
+	quarantine_size: int,
 	type_policy: Type_Class_Policy,
 	allocator: Allocator,
 	manual_type_registry: Manual_Type_Registry = {fallback_class = .Opaque},
@@ -376,6 +392,8 @@ hardened_allocator_init_metadata :: proc(
 	s.metadata = cast(^Hardened_Allocator_Metadata)raw_data(raw)
 
 	s.metadata.type_class_policy = type_policy
+	s.metadata.size_class_count = size_class_count
+	s.metadata.quarantine_size = quarantine_size
 
 	switch type_policy {
 	case .Randomized_Type_Signature:
@@ -392,7 +410,8 @@ hardened_allocator_init_metadata :: proc(
 			return .Invalid_Argument
 		}
 		s.metadata.manual_type_registry.fallback_class = manual_type_registry.fallback_class
-		s.metadata.manual_type_registry.use_fallback_class = manual_type_registry.use_fallback_class
+		s.metadata.manual_type_registry.use_fallback_class =
+			manual_type_registry.use_fallback_class
 		mtrerr: Allocator_Error
 		s.metadata.manual_type_registry.type_entries, mtrerr = hardened_allocator_alloc_slice(
 			Manual_Type_Entry,
@@ -419,15 +438,25 @@ hardened_allocator_init :: proc(
 	s: ^Hardened_Allocator,
 	fallback_allocator := context.allocator,
 	type_bucket_count := TYPE_BUCKET_COUNT,
+	size_class_count := SIZE_CLASS_COUNT,
+	quarantine_size := DEFAULT_QUARANTINE_SIZE,
 	type_policy := Type_Class_Policy.Randomized_Type_Signature,
 	manual_type_registry: Manual_Type_Registry = {fallback_class = .Opaque},
 	loc := #caller_location,
 ) -> Allocator_Error {
-	if type_bucket_count < 1 {
+	if type_bucket_count < 1 || size_class_count < 1 || quarantine_size < 1 {
 		return .Invalid_Argument
 	}
 
-	return hardened_allocator_init_metadata(s, type_bucket_count, type_policy, fallback_allocator, manual_type_registry)
+	return hardened_allocator_init_metadata(
+		s,
+		type_bucket_count,
+		size_class_count,
+		quarantine_size,
+		type_policy,
+		fallback_allocator,
+		manual_type_registry,
+	)
 }
 
 hardened_allocator_manual_registry_lookup :: proc(
@@ -459,7 +488,7 @@ hardened_allocator_alloc :: proc(
 ) -> (
 	rawptr,
 	Allocator_Error,
-) {	
+) {
 	sig := hardened_allocator_determine_type_signature(s, T)
 
 	if s.metadata.type_class_policy == .Manual_Registry {
@@ -527,6 +556,11 @@ hardened_allocator_destroy :: proc(s: ^Hardened_Allocator, loc := #caller_locati
 			s.fallback_allocator,
 		)
 		hardened_allocator_free_slice(sync.Mutex, zone.free_lists_mutex, s.fallback_allocator)
+		hardened_allocator_free_slice(
+			^Hardened_Allocator_Free_Block,
+			zone.quarantine,
+			s.fallback_allocator,
+		)
 
 		_free_memory(
 			slice.bytes_from_ptr(zone, size_of(Hardened_Allocator_Zone)),
@@ -628,6 +662,26 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 	return mem.byte_slice(rawptr(user_addr), size), nil
 }
 
+hardened_allocator_quarantine :: proc(
+	s: ^Hardened_Allocator,
+	zone: ^Hardened_Allocator_Zone,
+	block: ^Hardened_Allocator_Free_Block,
+) -> ^Hardened_Allocator_Free_Block {
+	sync.mutex_guard(&zone.quarantine_mutex)
+
+	if zone.quarantine_count + 1 < s.metadata.quarantine_size {
+		zone.quarantine[zone.quarantine_count] = block
+		zone.quarantine_count += 1
+		return nil
+	}
+
+	gen := crypto.random_generator()
+	index := rand.int_max(s.metadata.quarantine_size, gen)
+	other := zone.quarantine[index]
+	zone.quarantine[index] = block
+	return other
+}
+
 @(no_sanitize_address)
 hardened_allocator_free :: proc(
 	s: ^Hardened_Allocator,
@@ -675,8 +729,12 @@ hardened_allocator_free :: proc(
 	block.region = region
 	block.next = nil
 
-	block = hardened_allocator_coalesce(s, zone, block)
-	hardened_allocator_insert_free_block(s, &header.sig, block)
+	block = hardened_allocator_quarantine(s, zone, block)
+
+	if block != nil {
+		block = hardened_allocator_coalesce(s, zone, block)
+		hardened_allocator_insert_free_block(s, &header.sig, block)
+	}
 
 	return nil
 }
@@ -840,7 +898,7 @@ hardened_allocator_find_block :: proc(
 
 	zone := s.metadata.zones[sig.index]
 
-	for size_class_index in initial_size_class ..< SIZE_CLASS_COUNT {
+	for size_class_index in initial_size_class ..< s.metadata.size_class_count {
 		lock = &zone.free_lists_mutex[size_class_index]
 		sync.lock(lock)
 
@@ -904,7 +962,7 @@ hardened_allocator_class_index :: proc(s: ^Hardened_Allocator, size: int) -> int
 	threshold := MIN_SIZE_CLASS
 	size_idx := 0
 
-	for size_idx < SIZE_CLASS_COUNT - 1 && size > threshold {
+	for size_idx < s.metadata.size_class_count - 1 && size > threshold {
 		threshold <<= 1
 		size_idx += 1
 	}
@@ -946,7 +1004,7 @@ hardened_allocator_coalesce :: proc(
 	zone: ^Hardened_Allocator_Zone,
 	block: ^Hardened_Allocator_Free_Block,
 ) -> ^Hardened_Allocator_Free_Block {
-	for size_index in 0 ..< SIZE_CLASS_COUNT {
+	for size_index in 0 ..< s.metadata.size_class_count {
 		sync.mutex_guard(&zone.free_lists_mutex[size_index])
 
 		prev: ^Hardened_Allocator_Free_Block = nil
