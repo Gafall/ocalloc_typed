@@ -1,6 +1,7 @@
 package hardened_alloc
 
 import "base:runtime"
+import "core:log"
 import "core:mem"
 import "core:sync"
 
@@ -131,29 +132,31 @@ segregated_free_list_alloc_bytes_non_zeroed :: proc(
 		return nil, .Invalid_Argument
 	}
 
-	block, prev, class_index, used_size, padding, lock := segregated_free_list_find_block(
-		s,
-		size,
-		alignment,
-	)
-	if block == nil {
-		err := segregated_free_list_add_region_for_request(s, size, alignment, loc)
-		if err != nil {
-			return nil, err
-		}
+	block: ^Segregated_Free_Block
+	prev: ^Segregated_Free_Block
+	class_index: int
+	used_size: int
+	padding: int
+	lock: ^sync.Mutex
 
+	for {
 		block, prev, class_index, used_size, padding, lock = segregated_free_list_find_block(
 			s,
 			size,
 			alignment,
 		)
-		if block == nil {
-			return nil, .Out_Of_Memory
+
+		if block != nil {
+			segregated_free_list_remove_free_block(s, class_index, prev, block)
+			sync.unlock(lock)
+			break
+		}
+
+		err := segregated_free_list_add_region_for_request(s, size, alignment, loc)
+		if err != nil {
+			return nil, err
 		}
 	}
-
-	segregated_free_list_remove_free_block(s, class_index, prev, block)
-	sync.unlock(lock)
 
 	region := block.region
 
@@ -485,7 +488,7 @@ segregated_free_list_find_block :: proc(
 	class_index: int,
 	used_size: int,
 	padding: int,
-	lock: ^sync.Mutex
+	lock: ^sync.Mutex,
 ) {
 	minimum_possible := size + size_of(Segregated_Free_List_Allocation_Header)
 	if alignment > 1 {
@@ -497,9 +500,9 @@ segregated_free_list_find_block :: proc(
 	for class in start_class ..< SIZE_CLASS_COUNT {
 		lock = &s.free_lists_mutex[class]
 		sync.lock(lock)
-		
 		prev = nil
 		block = s.free_lists[class]
+		
 		for block != nil {
 			used_size, padding = segregated_free_list_required_block_size(block, size, alignment)
 			if used_size <= block.size {

@@ -596,33 +596,33 @@ hardened_allocator_alloc_bytes_non_zeroed :: proc(
 		return nil, .Invalid_Argument
 	}
 
-	block, prev, size_index, used_size, padding, lock := hardened_allocator_find_block(
-		s,
-		sig,
-		size,
-		alignment,
-	)
-	if block == nil {
-		err := hardened_allocator_add_region_for_request(s, sig, size, alignment, loc)
-		if err != nil {
-			return nil, err
-		}
-
+	block: ^Hardened_Allocator_Free_Block
+	prev: ^Hardened_Allocator_Free_Block
+	size_index: int
+	used_size: int
+	padding: int
+	lock: ^sync.Mutex
+	
+	for {
 		block, prev, size_index, used_size, padding, lock = hardened_allocator_find_block(
 			s,
 			sig,
 			size,
 			alignment,
 		)
-		if block == nil {
-			return nil, .Out_Of_Memory
+
+		if block != nil {
+			zone := s.metadata.zones[sig.index]
+			hardened_allocator_remove_free_block(s, zone, size_index, prev, block)
+			sync.unlock(lock)
+			break
+		}
+
+		err := hardened_allocator_add_region_for_request(s, sig, size, alignment, loc)
+		if err != nil {
+			return nil, err
 		}
 	}
-
-	zone := s.metadata.zones[sig.index]
-
-	hardened_allocator_remove_free_block(s, zone, size_index, prev, block)
-	sync.unlock(lock)
 
 	region := block.region
 
@@ -695,12 +695,21 @@ hardened_allocator_free :: proc(
 	user_addr := uintptr(ptr)
 	header_addr := user_addr - uintptr(size_of(Hardened_Allocator_Allocation_Header))
 	header := (^Hardened_Allocator_Allocation_Header)(rawptr(header_addr))
-	region := header.region
-	zone := region.zone
 
+	region := header.region
 	if region == nil {
 		return .Invalid_Pointer
 	}
+	zone := region.zone
+	if zone == nil {
+		return .Invalid_Pointer
+	}
+
+	sig := header.sig
+	block_size := header.block_size
+	requested_size := header.requested_size
+	padding := header.padding
+
 
 	region_start := uintptr(region.usable_start)
 	region_end := region_start + uintptr(region.usable_size)
@@ -708,15 +717,15 @@ hardened_allocator_free :: proc(
 	if !(region_start <= user_addr && user_addr < region_end) {
 		return .Invalid_Pointer
 	}
-	if header.padding < size_of(Hardened_Allocator_Allocation_Header) {
+	if padding < size_of(Hardened_Allocator_Allocation_Header) {
 		return .Invalid_Pointer
 	}
-	if header.block_size <= 0 || header.requested_size < 0 {
+	if block_size <= 0 || requested_size < 0 {
 		return .Invalid_Pointer
 	}
 
-	block_addr := user_addr - uintptr(header.padding)
-	block_end := block_addr + uintptr(header.block_size)
+	block_addr := user_addr - uintptr(padding)
+	block_end := block_addr + uintptr(block_size)
 	if !(region_start <= block_addr && block_addr < region_end) || block_end > region_end {
 		return .Invalid_Pointer
 	}
@@ -725,7 +734,7 @@ hardened_allocator_free :: proc(
 	}
 
 	block := (^Hardened_Allocator_Free_Block)(rawptr(block_addr))
-	block.size = header.block_size
+	block.size = block_size
 	block.region = region
 	block.next = nil
 
@@ -733,7 +742,7 @@ hardened_allocator_free :: proc(
 
 	if block != nil {
 		block = hardened_allocator_coalesce(s, zone, block)
-		hardened_allocator_insert_free_block(s, &header.sig, block)
+		hardened_allocator_insert_free_block(s, &sig, block)
 	}
 
 	return nil
@@ -768,7 +777,7 @@ hardened_allocator_proc :: proc(
 	case .Query_Features:
 		set := (^Allocator_Mode_Set)(old_memory)
 		if set != nil {
-			set^ = {.Free, .Resize, .Resize_Non_Zeroed, .Query_Features, .Query_Info}
+			set^ = {.Free, .Query_Features, .Query_Info}
 		}
 		return nil, nil
 
